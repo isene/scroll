@@ -276,9 +276,13 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             if src.is_empty() { return; }
             let alt = el.value().attr("alt").unwrap_or("image");
             let resolved = resolve_url(&ctx.base_url, src);
+            // Flush current line so image reserve starts on a fresh line
+            if !ctx.current_line.is_empty() { ctx.newline(); }
             let line = ctx.lines.len();
             ctx.images.push(ImageRef { src: resolved, alt: alt.to_string(), line, height: IMG_RESERVE });
             for _ in 0..IMG_RESERVE { ctx.lines.push(String::new()); }
+            // Reset col so next text starts fresh after image
+            ctx.col = 0;
         }
         "form" => {
             let action = el.value().attr("action").unwrap_or("").to_string();

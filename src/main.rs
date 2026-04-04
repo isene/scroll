@@ -407,15 +407,19 @@ impl App {
                 }
             }
             let filename = result.url.rsplit('/').next().unwrap_or("image");
-            self.tab_mut().content = format!("\n\n{}\n\n{}",
+            // Reserve blank lines for image, then show filename below
+            let reserve = (self.main.h as usize).min(30);
+            let mut content = String::new();
+            for _ in 0..reserve { content.push('\n'); }
+            content.push_str(&format!("\n{}\n{}",
                 crust::style::fg(filename, 81),
-                crust::style::fg(&result.url, 245));
+                crust::style::fg(&result.url, 245)));
+            self.tab_mut().content = content;
             self.tab_mut().title = filename.to_string();
             let url_clone = result.url.clone();
             self.tab_mut().url = url_clone.clone();
-            // Add as image at line 0 so glow displays it
             self.tab_mut().images = vec![crate::tab::ImageRef {
-                src: url_clone, alt: filename.to_string(), line: 0, height: 10,
+                src: url_clone, alt: filename.to_string(), line: 0, height: reserve,
             }];
         } else if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
             let width = self.main.w as usize;
