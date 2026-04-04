@@ -253,10 +253,9 @@ impl App {
             // Check if we have this image cached
             let cache_path = format!("/tmp/scroll_img_{}", img.src.replace('/', "_").replace(':', "_"));
             if !std::path::Path::new(&cache_path).exists() {
-                // Download image
-                let result = self.fetcher.fetch(&img.src, "GET", None);
-                if result.status == 200 && !result.body.is_empty() {
-                    let _ = std::fs::write(&cache_path, &result.body);
+                // Download image as binary
+                if let Some(bytes) = self.fetcher.fetch_bytes(&img.src) {
+                    let _ = std::fs::write(&cache_path, &bytes);
                 }
             }
 

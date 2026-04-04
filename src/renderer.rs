@@ -196,15 +196,39 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
                 return;
             }
             let resolved = resolve_url(&ctx.base_url, href);
-            let text = el.text().collect::<String>().trim().to_string();
-            let display = if text.is_empty() { href.to_string() } else { text };
-            ctx.link_index += 1;
-            let idx = ctx.link_index;
-            let line = ctx.lines.len();
-            ctx.links.push(Link { index: idx, href: resolved, text: display.clone(), line });
-            ctx.append(&format!("{}{}",
-                style::underline(&style::fg(&display, ctx.conf.c_link as u8)),
-                style::fg(&format!("[{}]", idx), ctx.conf.c_link_num as u8)));
+
+            // Check if link contains an image
+            let img_sel = scraper::Selector::parse("img").unwrap();
+            let has_img = el.select(&img_sel).next().is_some();
+
+            if has_img {
+                // Render the image (reserved space) with a link reference
+                for child_node in el.children() {
+                    if let Some(child_el) = ElementRef::wrap(child_node) {
+                        if child_el.value().name.local.as_ref() == "img" {
+                            handle_element(&child_el, ctx);
+                        }
+                    }
+                }
+                // Add link reference after image
+                ctx.link_index += 1;
+                let idx = ctx.link_index;
+                let line = ctx.lines.len();
+                let text = el.text().collect::<String>().trim().to_string();
+                let display = if text.is_empty() { "image link".to_string() } else { text };
+                ctx.links.push(Link { index: idx, href: resolved, text: display.clone(), line });
+                ctx.append(&style::fg(&format!("[{}]", idx), ctx.conf.c_link_num as u8));
+            } else {
+                let text = el.text().collect::<String>().trim().to_string();
+                let display = if text.is_empty() { href.to_string() } else { text };
+                ctx.link_index += 1;
+                let idx = ctx.link_index;
+                let line = ctx.lines.len();
+                ctx.links.push(Link { index: idx, href: resolved, text: display.clone(), line });
+                ctx.append(&format!("{}{}",
+                    style::underline(&style::fg(&display, ctx.conf.c_link as u8)),
+                    style::fg(&format!("[{}]", idx), ctx.conf.c_link_num as u8)));
+            }
         }
         "strong" | "b" => {
             let text = el.text().collect::<String>();

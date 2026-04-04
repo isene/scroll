@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use crate::config;
 
 pub struct Fetcher {
@@ -150,6 +151,30 @@ impl Fetcher {
                 status: 0,
             },
         }
+    }
+
+    /// Fetch binary data (for images) - returns raw bytes
+    pub fn fetch_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        let fetch_url = if !url.starts_with("http://") && !url.starts_with("https://") {
+            format!("https://{}", url)
+        } else {
+            url.to_string()
+        };
+
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(10))
+            .timeout_read(std::time::Duration::from_secs(10))
+            .redirects(10)
+            .build();
+
+        let resp = agent.get(&fetch_url)
+            .set("User-Agent", "scroll/0.1 (terminal browser)")
+            .call()
+            .ok()?;
+
+        let mut bytes = Vec::new();
+        resp.into_reader().read_to_end(&mut bytes).ok()?;
+        if bytes.is_empty() { None } else { Some(bytes) }
     }
 
     pub fn invalidate_cache(&mut self, url: &str) {
