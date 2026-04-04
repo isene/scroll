@@ -14,6 +14,26 @@ pub struct RenderResult {
     pub site_fg: Option<u8>,
 }
 
+/// Highlight a specific link index in rendered content by wrapping its line in reverse
+pub fn highlight_link(content: &str, links: &[Link], focus_idx: usize) -> String {
+    if focus_idx >= links.len() { return content.to_string(); }
+    let target_line = links[focus_idx].line;
+    let link_text = &links[focus_idx].text;
+    content.lines().enumerate().map(|(i, line)| {
+        if i == target_line {
+            // Wrap the focused link text in reverse
+            let plain = crust::strip_ansi(line);
+            if plain.contains(link_text.as_str()) {
+                style::reverse(line)
+            } else {
+                line.to_string()
+            }
+        } else {
+            line.to_string()
+        }
+    }).collect::<Vec<_>>().join("\n")
+}
+
 pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::config::Config) -> RenderResult {
     let doc = Html::parse_document(html);
     let mut ctx = RenderContext {
@@ -200,6 +220,11 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             // Check if link contains an image
             let img_sel = scraper::Selector::parse("img").unwrap();
             let has_img = el.select(&img_sel).next().is_some();
+
+            // Ensure space before link if text precedes it
+            if ctx.col > ctx.indent && !ctx.current_line.ends_with(' ') {
+                ctx.append(" ");
+            }
 
             if has_img {
                 // Render the image (reserved space) with a link reference
@@ -451,6 +476,14 @@ fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
     }
     let total: usize = col_widths.iter().sum::<usize>() + num_cols * 3 + 1;
     if total <= ctx.width {
+        // Top border
+        let top: String = col_widths.iter().enumerate().map(|(i, w)| {
+            let bar = "\u{2500}".repeat(w + 2);
+            if i == 0 { format!("\u{250C}{}", bar) }
+            else { format!("\u{252C}{}", bar) }
+        }).collect::<Vec<_>>().join("");
+        ctx.append(&format!("{}\u{2510}", top)); ctx.newline();
+
         for (ri, row) in rows.iter().enumerate() {
             let mut line = "\u{2502}".to_string();
             for (ci, cell) in row.iter().enumerate() {
@@ -458,14 +491,27 @@ fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
                 line.push_str(&format!(" {:<w$} \u{2502}", cell, w = w));
             }
             ctx.append(&line); ctx.newline();
-            if ri == 0 {
-                let sep: String = col_widths.iter()
-                    .map(|w| format!("\u{253C}{}", "\u{2500}".repeat(w + 2)))
-                    .collect::<Vec<_>>().join("");
-                ctx.append(&format!("\u{253C}{}", sep)); ctx.newline();
+
+            // Separator after header row
+            if ri == 0 && rows.len() > 1 {
+                let sep: String = col_widths.iter().enumerate().map(|(i, w)| {
+                    let bar = "\u{2500}".repeat(w + 2);
+                    if i == 0 { format!("\u{251C}{}", bar) }
+                    else { format!("\u{253C}{}", bar) }
+                }).collect::<Vec<_>>().join("");
+                ctx.append(&format!("{}\u{2524}", sep)); ctx.newline();
             }
         }
+
+        // Bottom border
+        let bot: String = col_widths.iter().enumerate().map(|(i, w)| {
+            let bar = "\u{2500}".repeat(w + 2);
+            if i == 0 { format!("\u{2514}{}", bar) }
+            else { format!("\u{2534}{}", bar) }
+        }).collect::<Vec<_>>().join("");
+        ctx.append(&format!("{}\u{2518}", bot)); ctx.newline();
     } else {
+        // Vertical layout for wide tables
         for row in &rows {
             for (i, cell) in row.iter().enumerate() {
                 if !cell.is_empty() { ctx.append(&format!("{}: {}", i, cell)); ctx.newline(); }

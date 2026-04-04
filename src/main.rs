@@ -580,14 +580,19 @@ impl App {
         let link_text = self.tabs[self.current_tab].links[idx].text.clone();
         let href = self.tabs[self.current_tab].links[idx].href.clone();
 
-        // Scroll to show the focused link
+        // Highlight the focused link on the page
+        let content = self.tabs[self.current_tab].content.clone();
+        let links = self.tabs[self.current_tab].links.clone();
+        let highlighted = renderer::highlight_link(&content, &links, idx);
+
         self.clear_images();
         self.tabs[self.current_tab].ix = line.saturating_sub(3);
+        self.main.set_text(&highlighted);
         self.main.ix = self.tabs[self.current_tab].ix;
         self.main.full_refresh();
         if self.conf.show_images { self.show_visible_images(); }
 
-        // Show focused link info with reverse highlight in status bar
+        // Show focused link info in status bar
         self.status.say(&format!(" {} {} {}",
             style::fg(&format!("[{}]", link_idx), self.conf.c_link_num as u8),
             style::reverse(&link_text),
