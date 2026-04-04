@@ -351,12 +351,17 @@ impl App {
     fn render_status(&mut self) {
         let tab = &self.tabs[self.current_tab];
         let n_links = tab.links.len();
-        let msg = if n_links > 0 {
-            format!(" {} links | {}", n_links, tab.url)
+        let left = if n_links > 0 {
+            format!(" {} links | ? help | : command", n_links)
         } else {
-            format!(" {}", tab.url)
+            " ? help | : command".to_string()
         };
-        self.status.say(&msg);
+        let version = format!("scroll v{}", env!("CARGO_PKG_VERSION"));
+        let url = &tab.url;
+        let mid = format!(" | {}", url);
+        let total_left = crust::display_width(&left) + crust::display_width(&mid);
+        let pad = (self.cols as usize).saturating_sub(total_left + version.len() + 1);
+        self.status.say(&format!("{}{}{}{}", left, mid, " ".repeat(pad), version));
     }
 
     // --- Navigation ---
