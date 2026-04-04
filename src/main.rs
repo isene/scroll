@@ -318,7 +318,13 @@ impl App {
                 let y_offset = img.line.saturating_sub(viewport_top) as u16;
                 let display_y = self.main.y + y_offset;
                 let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
-                display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
+
+                if self.conf.image_mode == "ascii" {
+                    // ASCII art via chafa
+                    show_ascii_image(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
+                } else {
+                    display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
+                }
             }
         }
     }
@@ -798,7 +804,7 @@ impl App {
     // --- Preferences ---
 
     fn show_preferences(&mut self) {
-        let items: Vec<PrefItem> = vec![
+        let mut items: Vec<PrefItem> = vec![
             PrefItem::Bool("Match site colors", self.conf.match_site_colors),
             PrefItem::Choice("Image mode", vec!["auto", "ascii", "off"], self.conf.image_mode.clone()),
             PrefItem::Bool("Show images", self.conf.show_images),
@@ -822,34 +828,37 @@ impl App {
         ];
 
         let mut sel = 0usize;
-        let mut items = items;
         let mut dirty = false;
 
+        // Create centered popup pane
+        let pw = 56u16.min(self.cols - 4);
+        let ph = (items.len() as u16 + 5).min(self.rows - 6);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 255, 235);
+        popup.border = true;
+        popup.border_refresh();
+
         loop {
-            // Draw popup over main pane
-            let mut lines = vec![
-                style::fg(&style::bold("Preferences"), 81),
-                style::fg(&"\u{2500}".repeat(50), 245),
-                String::new(),
-            ];
+            let mut lines = Vec::new();
+            lines.push(format!(" {}", style::fg(&style::bold("Preferences"), 81)));
+            lines.push(String::new());
+
             for (i, item) in items.iter().enumerate() {
-                let label = item.label();
+                let label = format!("{:<18}", item.label());
                 let value_str = item.display();
-                let arrow_l = if i == sel { "\u{25C0} " } else { "  " };
-                let arrow_r = if i == sel { " \u{25B6}" } else { "  " };
-                let line = if i == sel {
-                    format!("  {}{:<18}{}{}", style::underline(label), arrow_l, value_str, arrow_r)
+                if i == sel {
+                    lines.push(format!(" {} \u{25C0} {} \u{25B6}", style::reverse(&label), value_str));
                 } else {
-                    format!("  {:<18}{}{}{}", label, arrow_l, value_str, arrow_r)
-                };
-                lines.push(line);
+                    lines.push(format!(" {}   {}  ", label, value_str));
+                }
             }
             lines.push(String::new());
-            lines.push(style::fg("  j/k:navigate  h/l:change  Enter:edit  ESC:save & close", 245));
+            lines.push(style::fg(" j/k h/l Enter ESC", 245));
 
-            self.main.set_text(&lines.join("\n"));
-            self.main.ix = 0;
-            self.main.full_refresh();
+            popup.set_text(&lines.join("\n"));
+            popup.ix = 0;
+            popup.full_refresh();
 
             let Some(key) = Input::getchr(None) else { continue };
             match key.as_str() {
@@ -1087,6 +1096,24 @@ impl App {
 }
 
 // --- Helpers ---
+
+/// Render image as ASCII art via chafa and print at position
+fn show_ascii_image(path: &str, x: u16, y: u16, max_w: u16, max_h: u16) {
+    let output = std::process::Command::new("chafa")
+        .args(["--size", &format!("{}x{}", max_w, max_h), "--animate", "off"])
+        .arg(path)
+        .output();
+    if let Ok(o) = output {
+        if o.status.success() {
+            let text = String::from_utf8_lossy(&o.stdout);
+            for (i, line) in text.lines().enumerate() {
+                if i >= max_h as usize { break; }
+                print!("\x1b[{};{}H{}", y + i as u16, x, line);
+            }
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+    }
+}
 
 fn img_cache_path(src: &str) -> String {
     format!("/tmp/scroll_img_{}", src.replace('/', "_").replace(':', "_").replace('?', "_"))
