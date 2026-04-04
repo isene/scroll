@@ -6,10 +6,17 @@ mod tab;
 use crust::{Crust, Pane, Input};
 use crust::style;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use config::Config;
 use fetcher::Fetcher;
 use tab::Tab;
+
+/// Shared state for async image downloads
+struct ImgDownloadState {
+    pending: Vec<(String, String)>,  // (url, cache_path) pairs to download
+    ready: Vec<String>,              // cache paths that finished downloading
+}
 
 struct App {
     info: Pane,
@@ -34,6 +41,8 @@ struct App {
     quickmarks: HashMap<String, (String, String)>,
     passwords: HashMap<String, (String, String)>,
     image_display: Option<glow::Display>,
+    img_state: Arc<Mutex<ImgDownloadState>>,
+    img_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 fn main() {
@@ -70,6 +79,8 @@ fn main() {
         quickmarks: config::load_quickmarks(),
         passwords: config::load_passwords(),
         image_display: Some(glow::Display::new()),
+        img_state: Arc::new(Mutex::new(ImgDownloadState { pending: Vec::new(), ready: Vec::new() })),
+        img_thread: None,
     };
 
     app.main.scroll = true;
@@ -80,7 +91,12 @@ fn main() {
     app.render_all();
 
     while app.running {
-        let Some(key) = Input::getchr(Some(2)) else {
+        // Check for newly downloaded images on each loop iteration
+        app.check_new_images();
+
+        let Some(key) = Input::getchr(Some(1)) else {
+            // Timeout: check images again, continue
+            app.check_new_images();
             continue;
         };
 
@@ -235,6 +251,54 @@ impl App {
         }
     }
 
+    /// Start async download of all images on the page
+    fn start_image_downloads(&mut self) {
+        let images = self.tabs[self.current_tab].images.clone();
+        if images.is_empty() { return; }
+
+        // Queue all images for download
+        let mut pending = Vec::new();
+        for img in &images {
+            let cache_path = img_cache_path(&img.src);
+            if !std::path::Path::new(&cache_path).exists() {
+                pending.push((img.src.clone(), cache_path));
+            }
+        }
+        if pending.is_empty() { return; }
+
+        {
+            let mut state = self.img_state.lock().unwrap();
+            state.pending = pending.clone();
+            state.ready.clear();
+        }
+
+        // Spawn background thread to download all images
+        let state = self.img_state.clone();
+        self.img_thread = Some(std::thread::spawn(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_connect(std::time::Duration::from_secs(10))
+                .timeout_read(std::time::Duration::from_secs(10))
+                .redirects(10)
+                .build();
+
+            for (url, cache_path) in &pending {
+                if std::path::Path::new(cache_path).exists() { continue; }
+                let resp = agent.get(url)
+                    .set("User-Agent", "scroll/0.1")
+                    .call();
+                if let Ok(resp) = resp {
+                    let mut bytes = Vec::new();
+                    if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && !bytes.is_empty() {
+                        let _ = std::fs::write(cache_path, &bytes);
+                        let mut s = state.lock().unwrap();
+                        s.ready.push(cache_path.clone());
+                    }
+                }
+            }
+        }));
+    }
+
+    /// Show images that are in viewport AND already cached locally
     fn show_visible_images(&mut self) {
         let Some(ref mut display) = self.image_display else { return };
         if !display.supported() { return; }
@@ -245,26 +309,31 @@ impl App {
         let images = self.tabs[self.current_tab].images.clone();
 
         for img in &images {
-            // Check if image is in viewport
             if img.line + img.height <= viewport_top || img.line >= viewport_bottom {
                 continue;
             }
 
-            // Check if we have this image cached
-            let cache_path = format!("/tmp/scroll_img_{}", img.src.replace('/', "_").replace(':', "_"));
-            if !std::path::Path::new(&cache_path).exists() {
-                // Download image as binary
-                if let Some(bytes) = self.fetcher.fetch_bytes(&img.src) {
-                    let _ = std::fs::write(&cache_path, &bytes);
-                }
-            }
-
+            let cache_path = img_cache_path(&img.src);
             if std::path::Path::new(&cache_path).exists() {
                 let y_offset = img.line.saturating_sub(viewport_top) as u16;
                 let display_y = self.main.y + y_offset;
                 let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
-                display.show(&cache_path, self.main.x, display_y, self.main.w, display_h);
+                display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
             }
+        }
+    }
+
+    /// Check if any new images finished downloading, show them if in viewport
+    fn check_new_images(&mut self) {
+        let has_new = {
+            let state = self.img_state.lock().unwrap();
+            !state.ready.is_empty()
+        };
+        if has_new {
+            let mut state = self.img_state.lock().unwrap();
+            state.ready.clear();
+            drop(state);
+            self.show_visible_images();
         }
     }
 
@@ -338,6 +407,8 @@ impl App {
         self.search_term.clear();
         self.search_matches.clear();
         self.render_all();
+        // Start async image downloads for the page
+        self.start_image_downloads();
     }
 
     fn go_back(&mut self) {
@@ -377,6 +448,7 @@ impl App {
         self.tab_mut().url = result.url;
         self.focus_index = -1;
         self.render_all();
+        self.start_image_downloads();
     }
 
     // --- Scrolling ---
@@ -1000,6 +1072,10 @@ impl App {
 }
 
 // --- Helpers ---
+
+fn img_cache_path(src: &str) -> String {
+    format!("/tmp/scroll_img_{}", src.replace('/', "_").replace(':', "_").replace('?', "_"))
+}
 
 fn resolve_search(input: &str, default_engine: &str) -> String {
     let input = input.trim();
