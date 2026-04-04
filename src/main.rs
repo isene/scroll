@@ -54,6 +54,8 @@ fn main() {
     let (cols, rows) = Crust::terminal_size();
 
     let conf = Config::load();
+    let show_imgs = conf.show_images;
+    let img_mode = conf.image_mode.clone();
     let main_h = rows.saturating_sub(3);
 
     let mut app = App {
@@ -78,7 +80,9 @@ fn main() {
         bookmarks: config::load_bookmarks(),
         quickmarks: config::load_quickmarks(),
         passwords: config::load_passwords(),
-        image_display: Some(glow::Display::new()),
+        image_display: if show_imgs {
+            Some(glow::Display::with_mode(&img_mode))
+        } else { None },
         img_state: Arc::new(Mutex::new(ImgDownloadState { pending: Vec::new(), ready: Vec::new() })),
         img_thread: None,
     };
@@ -318,13 +322,7 @@ impl App {
                 let y_offset = img.line.saturating_sub(viewport_top) as u16;
                 let display_y = self.main.y + y_offset;
                 let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
-
-                if self.conf.image_mode == "ascii" {
-                    // ASCII art via chafa
-                    show_ascii_image(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
-                } else {
-                    display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
-                }
+                display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
             }
         }
     }
@@ -913,6 +911,12 @@ impl App {
                 }
             }
             self.conf.save();
+            // Recreate glow Display with new image mode
+            self.image_display = if self.conf.show_images {
+                Some(glow::Display::with_mode(&self.conf.image_mode))
+            } else {
+                None
+            };
             self.status.say(&style::fg(" Preferences saved", 82));
         }
         self.render_all();
@@ -1096,24 +1100,6 @@ impl App {
 }
 
 // --- Helpers ---
-
-/// Render image as ASCII art via chafa and print at position
-fn show_ascii_image(path: &str, x: u16, y: u16, max_w: u16, max_h: u16) {
-    let output = std::process::Command::new("chafa")
-        .args(["--size", &format!("{}x{}", max_w, max_h), "--animate", "off"])
-        .arg(path)
-        .output();
-    if let Ok(o) = output {
-        if o.status.success() {
-            let text = String::from_utf8_lossy(&o.stdout);
-            for (i, line) in text.lines().enumerate() {
-                if i >= max_h as usize { break; }
-                print!("\x1b[{};{}H{}", y + i as u16, x, line);
-            }
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-        }
-    }
-}
 
 fn img_cache_path(src: &str) -> String {
     format!("/tmp/scroll_img_{}", src.replace('/', "_").replace(':', "_").replace('?', "_"))
