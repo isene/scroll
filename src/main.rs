@@ -357,6 +357,7 @@ impl App {
     // --- Navigation ---
 
     fn navigate(&mut self, url: &str) {
+        self.clear_images();
         let resolved = resolve_search(url, &self.conf.search_engine);
 
         // Handle about: URLs
@@ -480,11 +481,13 @@ impl App {
     }
 
     fn scroll_bottom(&mut self) {
+        self.clear_images();
         let lc = self.tab().content.lines().count();
         let page = self.main.h as usize;
         self.tabs[self.current_tab].ix = lc.saturating_sub(page);
         self.main.ix = self.tabs[self.current_tab].ix;
-        self.main.refresh();
+        self.main.full_refresh();
+        if self.conf.show_images { self.show_visible_images(); }
     }
 
     // --- Tabs ---
@@ -553,58 +556,65 @@ impl App {
     // --- Focus / Links / Forms ---
 
     fn focus_next(&mut self) {
-        let n_focusable = self.tab().links.len() + self.tab().forms.iter().map(|f| f.fields.iter().filter(|fi| fi.field_type != "hidden").count()).sum::<usize>();
-        if n_focusable == 0 { return; }
-        self.focus_index = ((self.focus_index + 1) as usize % n_focusable) as i32;
+        let n_links = self.tabs[self.current_tab].links.len();
+        if n_links == 0 { return; }
+        // Only cycle through links (not form fields for simplicity)
+        self.focus_index = ((self.focus_index + 1) as usize % n_links) as i32;
         self.scroll_to_focused();
     }
 
     fn focus_prev(&mut self) {
-        let n_focusable = self.tab().links.len() + self.tab().forms.iter().map(|f| f.fields.iter().filter(|fi| fi.field_type != "hidden").count()).sum::<usize>();
-        if n_focusable == 0 { return; }
-        self.focus_index = if self.focus_index <= 0 { n_focusable as i32 - 1 } else { self.focus_index - 1 };
+        let n_links = self.tabs[self.current_tab].links.len();
+        if n_links == 0 { return; }
+        self.focus_index = if self.focus_index <= 0 { n_links as i32 - 1 } else { self.focus_index - 1 };
         self.scroll_to_focused();
     }
 
     fn scroll_to_focused(&mut self) {
         let idx = self.focus_index as usize;
         let n_links = self.tabs[self.current_tab].links.len();
+        if idx >= n_links { return; }
 
-        if idx < n_links {
-            let line = self.tabs[self.current_tab].links[idx].line;
-            let link_idx = self.tabs[self.current_tab].links[idx].index;
-            let href = self.tabs[self.current_tab].links[idx].href.clone();
-            self.tabs[self.current_tab].ix = line.saturating_sub(3);
-            self.main.ix = self.tabs[self.current_tab].ix;
-            self.main.refresh();
-            self.status.say(&format!(" [{}] {}", link_idx, href));
-        } else {
-            let field_idx = idx - n_links;
-            let forms = self.tabs[self.current_tab].forms.clone();
-            let mut count = 0;
-            for form in &forms {
-                for field in &form.fields {
-                    if field.field_type == "hidden" { continue; }
-                    if count == field_idx {
-                        self.tabs[self.current_tab].ix = field.line.saturating_sub(3);
-                        self.main.ix = self.tabs[self.current_tab].ix;
-                        self.main.refresh();
-                        self.status.say(&format!(" [{}] {}", field.field_type, field.name));
-                        return;
-                    }
-                    count += 1;
-                }
-            }
-        }
+        let line = self.tabs[self.current_tab].links[idx].line;
+        let link_idx = self.tabs[self.current_tab].links[idx].index;
+        let link_text = self.tabs[self.current_tab].links[idx].text.clone();
+        let href = self.tabs[self.current_tab].links[idx].href.clone();
+
+        // Scroll to show the focused link
+        self.clear_images();
+        self.tabs[self.current_tab].ix = line.saturating_sub(3);
+        self.main.ix = self.tabs[self.current_tab].ix;
+        self.main.full_refresh();
+        if self.conf.show_images { self.show_visible_images(); }
+
+        // Show focused link info with reverse highlight in status bar
+        self.status.say(&format!(" {} {} {}",
+            style::fg(&format!("[{}]", link_idx), self.conf.c_link_num as u8),
+            style::reverse(&link_text),
+            style::fg(&href, 245)));
     }
 
+    /// ENTER: if focused on a link, follow it. Otherwise prompt for link number.
     fn follow_focused(&mut self) {
-        if self.focus_index < 0 { return; }
-        let idx = self.focus_index as usize;
-        let n_links = self.tab().links.len();
-        if idx < n_links {
-            let href = self.tab().links[idx].href.clone();
-            self.navigate(&href);
+        if self.focus_index >= 0 {
+            let idx = self.focus_index as usize;
+            let n_links = self.tabs[self.current_tab].links.len();
+            if idx < n_links {
+                let href = self.tabs[self.current_tab].links[idx].href.clone();
+                self.navigate(&href);
+                return;
+            }
+        }
+        // Prompt for link number
+        let input = self.status.ask_with_bg("Link #: ", "", 18);
+        if input.is_empty() { return; }
+        if let Ok(num) = input.parse::<usize>() {
+            if let Some(link) = self.tabs[self.current_tab].links.iter().find(|l| l.index == num) {
+                let href = link.href.clone();
+                self.navigate(&href);
+            } else {
+                self.status.say(&style::fg(&format!(" Link {} not found", num), 196));
+            }
         }
     }
 
