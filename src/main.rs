@@ -322,7 +322,8 @@ impl App {
                 let y_offset = img.line.saturating_sub(viewport_top) as u16;
                 let display_y = self.main.y + y_offset;
                 let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
-                display.show(&cache_path, self.main.x, display_y, self.main.w / 2, display_h);
+                let img_w = (self.main.w / 3).max(30).min(80);
+                display.show(&cache_path, self.main.x, display_y, img_w, display_h);
             }
         }
     }
@@ -796,6 +797,12 @@ impl App {
 
     fn toggle_images(&mut self) {
         self.conf.show_images = !self.conf.show_images;
+        if self.conf.show_images {
+            self.image_display = Some(glow::Display::with_mode(&self.conf.image_mode));
+        } else {
+            self.clear_images();
+            self.image_display = None;
+        }
         self.status.say(&format!(" Images: {}", if self.conf.show_images { "on" } else { "off" }));
     }
 
@@ -911,13 +918,20 @@ impl App {
                 }
             }
             self.conf.save();
+            // Clear existing images before switching mode
+            self.clear_images();
             // Recreate glow Display with new image mode
-            self.image_display = if self.conf.show_images {
+            let new_display = if self.conf.show_images {
                 Some(glow::Display::with_mode(&self.conf.image_mode))
             } else {
                 None
             };
-            self.status.say(&style::fg(" Preferences saved", 82));
+            self.image_display = new_display;
+            let mode_info = self.image_display.as_ref()
+                .and_then(|d| d.protocol())
+                .map(|p| format!("{:?}", p))
+                .unwrap_or_else(|| "off".into());
+            self.status.say(&style::fg(&format!(" Preferences saved (images: {})", mode_info), 82));
         }
         self.render_all();
     }
