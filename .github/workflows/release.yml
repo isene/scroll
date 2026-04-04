@@ -5,42 +5,48 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            name: scroll-linux-x86_64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            name: scroll-linux-aarch64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            name: scroll-macos-x86_64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            name: scroll-macos-aarch64
-
-    runs-on: ${{ matrix.os }}
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scroll-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: scroll-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: scroll-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: scroll-macos-aarch64
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: scroll
 
       - name: Checkout crust
         uses: actions/checkout@v4
         with:
           repository: isene/crust
-          path: ../crust
+          path: crust
 
       - name: Checkout glow
         uses: actions/checkout@v4
         with:
           repository: isene/glow
-          path: ../glow
+          path: glow
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
@@ -49,21 +55,57 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo '[target.aarch64-unknown-linux-gnu]' >> ~/.cargo/config.toml
-          echo 'linker = "aarch64-linux-gnu-gcc"' >> ~/.cargo/config.toml
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
 
       - name: Build
+        working-directory: scroll
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
+        working-directory: scroll
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz scroll
-          cd ../../..
+          cp target/${{ matrix.target }}/release/scroll ../${{ matrix.artifact }}
+          chmod +x ../${{ matrix.artifact }}
 
-      - name: Upload
-        uses: softprops/action-gh-release@v1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ matrix.name }}.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*/*
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download the binary for your platform:
+            ```bash
+            chmod +x scroll-*
+            ./scroll-linux-x86_64    # or your platform
+            ```
+
+            Optionally copy to your PATH:
+            ```bash
+            sudo cp scroll-linux-x86_64 /usr/local/bin/scroll
+            ```
+
+            ## Platforms
+            - `scroll-linux-x86_64` - Linux (Intel/AMD 64-bit)
+            - `scroll-linux-aarch64` - Linux (ARM 64-bit, Raspberry Pi)
+            - `scroll-macos-x86_64` - macOS (Intel)
+            - `scroll-macos-aarch64` - macOS (Apple Silicon)
