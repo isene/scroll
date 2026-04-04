@@ -5,7 +5,8 @@ use crate::config;
 
 pub struct Fetcher {
     cookies: HashMap<String, HashMap<String, String>>,
-    cache: Vec<(String, FetchResult)>,
+    cache: HashMap<String, FetchResult>,
+    cache_order: Vec<String>,  // LRU order for eviction
     max_cache: usize,
 }
 
@@ -24,14 +25,14 @@ impl Fetcher {
             .and_then(|p| fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Fetcher { cookies, cache: Vec::new(), max_cache: 20 }
+        Fetcher { cookies, cache: HashMap::new(), cache_order: Vec::new(), max_cache: 20 }
     }
 
     pub fn fetch(&mut self, url: &str, method: &str, params: Option<&HashMap<String, String>>) -> FetchResult {
-        // Check cache for GET without params
+        // Check cache for GET without params (O(1) HashMap lookup)
         if method == "GET" && params.is_none() {
-            if let Some(cached) = self.cache.iter().find(|(u, _)| u == url) {
-                return cached.1.clone();
+            if let Some(cached) = self.cache.get(url) {
+                return cached.clone();
             }
         }
 
@@ -127,9 +128,16 @@ impl Fetcher {
 
                 // Cache GET results
                 if method == "GET" && params.is_none() && status == 200 {
-                    self.cache.push((url.to_string(), result.clone()));
-                    if self.cache.len() > self.max_cache {
-                        self.cache.remove(0);
+                    let key = url.to_string();
+                    if !self.cache.contains_key(&key) {
+                        self.cache_order.push(key.clone());
+                    }
+                    self.cache.insert(key, result.clone());
+                    while self.cache.len() > self.max_cache {
+                        if let Some(oldest) = self.cache_order.first().cloned() {
+                            self.cache.remove(&oldest);
+                            self.cache_order.remove(0);
+                        } else { break; }
                     }
                 }
 
@@ -178,28 +186,21 @@ impl Fetcher {
     }
 
     pub fn invalidate_cache(&mut self, url: &str) {
-        self.cache.retain(|(u, _)| u != url);
+        self.cache.remove(url);
+        self.cache_order.retain(|u| u != url);
     }
 
     fn store_response_cookies(&mut self, url: &str, resp: &ureq::Response) {
         if let Ok(parsed) = url::Url::parse(url) {
             if let Some(domain) = parsed.host_str() {
-                // ureq doesn't expose Set-Cookie easily; use header iteration
-                let mut idx = 0;
-                loop {
-                    let key = "set-cookie";
-                    let has_cookie = resp.headers_names().iter()
-                        .any(|h| h.eq_ignore_ascii_case(key));
-                    if !has_cookie { break; }
-                    if let Some(val) = resp.header(key) {
-                        if let Some((name_val, _)) = val.split_once(';') {
-                            if let Some((name, value)) = name_val.split_once('=') {
-                                let entry = self.cookies.entry(domain.to_string()).or_default();
-                                entry.insert(name.trim().to_string(), value.trim().to_string());
-                            }
+                // ureq 2.x only exposes first Set-Cookie via header()
+                if let Some(val) = resp.header("set-cookie") {
+                    if let Some((name_val, _)) = val.split_once(';') {
+                        if let Some((name, value)) = name_val.split_once('=') {
+                            let entry = self.cookies.entry(domain.to_string()).or_default();
+                            entry.insert(name.trim().to_string(), value.trim().to_string());
                         }
                     }
-                    break; // ureq only returns first header with same name
                 }
                 self.save_cookies();
             }

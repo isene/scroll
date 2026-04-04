@@ -5,7 +5,7 @@ mod tab;
 
 use crust::{Crust, Pane, Input};
 use crust::style;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use config::Config;
@@ -43,6 +43,7 @@ struct App {
     image_display: Option<glow::Display>,
     img_state: Arc<Mutex<ImgDownloadState>>,
     img_thread: Option<std::thread::JoinHandle<()>>,
+    adblock_domains: HashSet<String>,
 }
 
 fn main() {
@@ -85,6 +86,7 @@ fn main() {
         } else { None },
         img_state: Arc::new(Mutex::new(ImgDownloadState { pending: Vec::new(), ready: Vec::new() })),
         img_thread: None,
+        adblock_domains: load_adblock(),
     };
 
     app.main.scroll = true;
@@ -95,11 +97,12 @@ fn main() {
     app.render_all();
 
     while app.running {
-        // Check for newly downloaded images on each loop iteration
-        app.check_new_images();
+        // Only poll frequently when images are downloading; otherwise block
+        let has_pending = app.img_thread.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+        if has_pending { app.check_new_images(); }
+        let timeout = if has_pending { Some(1) } else { None };
 
-        let Some(key) = Input::getchr(Some(1)) else {
-            // Timeout: check images again, continue
+        let Some(key) = Input::getchr(timeout) else {
             app.check_new_images();
             continue;
         };
@@ -161,6 +164,13 @@ fn main() {
             // Clipboard
             "y" => { app.copy_url(); }
             "Y" => { app.copy_focused_url(); }
+
+            // Edit
+            "e" => { app.edit_source(); }
+            "C-G" => { app.edit_form_field(); }
+
+            // Passwords
+            "p" => { app.show_password(); }
 
             // Images
             "i" => { app.toggle_images(); }
@@ -260,9 +270,10 @@ impl App {
         let images = self.tabs[self.current_tab].images.clone();
         if images.is_empty() { return; }
 
-        // Queue all images for download
+        // Queue all images for download (skip blocked ad domains)
         let mut pending = Vec::new();
         for img in &images {
+            if self.is_blocked(&img.src) { continue; }
             let cache_path = img_cache_path(&img.src);
             if !std::path::Path::new(&cache_path).exists() {
                 pending.push((img.src.clone(), cache_path));
@@ -291,6 +302,25 @@ impl App {
                     .set("User-Agent", "scroll/0.1")
                     .call();
                 if let Ok(resp) = resp {
+                    let ct = resp.content_type().to_string();
+                    // oEmbed: JSON response containing thumbnail_url
+                    if ct.contains("json") && url.contains("oembed") {
+                        if let Ok(body) = resp.into_string() {
+                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                                if let Some(thumb) = json["thumbnail_url"].as_str() {
+                                    if let Ok(tr) = agent.get(thumb).call() {
+                                        let mut bytes = Vec::new();
+                                        if std::io::Read::read_to_end(&mut tr.into_reader(), &mut bytes).is_ok() && !bytes.is_empty() {
+                                            let _ = std::fs::write(cache_path, &bytes);
+                                            let mut s = state.lock().unwrap();
+                                            s.ready.push(cache_path.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     let mut bytes = Vec::new();
                     if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && !bytes.is_empty() {
                         let _ = std::fs::write(cache_path, &bytes);
@@ -313,17 +343,27 @@ impl App {
         let images = self.tabs[self.current_tab].images.clone();
 
         for img in &images {
+            // Skip images fully outside viewport
             if img.line + img.height <= viewport_top || img.line >= viewport_bottom {
                 continue;
             }
 
             let cache_path = img_cache_path(&img.src);
             if std::path::Path::new(&cache_path).exists() {
-                let y_offset = img.line.saturating_sub(viewport_top) as u16;
-                let display_y = self.main.y + y_offset;
-                let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
                 let img_w = (self.main.w / 3).max(30).min(80);
-                display.show(&cache_path, self.main.x, display_y, img_w, display_h);
+                if img.line < viewport_top {
+                    // Partially scrolled off top: shrink (kitty uses r= so no re-conversion)
+                    let visible_rows = (img.line + img.height - viewport_top) as u16;
+                    if visible_rows > 0 {
+                        display.show(&cache_path, self.main.x, self.main.y, img_w, visible_rows);
+                    }
+                } else {
+                    // Normal display, clipped to bottom of pane
+                    let y_offset = (img.line - viewport_top) as u16;
+                    let display_y = self.main.y + y_offset;
+                    let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
+                    display.show(&cache_path, self.main.x, display_y, img_w, display_h);
+                }
             }
         }
     }
@@ -406,20 +446,20 @@ impl App {
                     let _ = std::fs::write(&cache_path, &bytes);
                 }
             }
-            let filename = result.url.rsplit('/').next().unwrap_or("image");
+            let url = result.url;
+            let filename = url.rsplit('/').next().unwrap_or("image").to_string();
             // Reserve blank lines for image, then show filename below
             let reserve = (self.main.h as usize).min(30);
             let mut content = String::new();
             for _ in 0..reserve { content.push('\n'); }
             content.push_str(&format!("\n{}\n{}",
-                crust::style::fg(filename, 81),
-                crust::style::fg(&result.url, 245)));
+                crust::style::fg(&filename, 81),
+                crust::style::fg(&url, 245)));
             self.tab_mut().content = content;
-            self.tab_mut().title = filename.to_string();
-            let url_clone = result.url.clone();
-            self.tab_mut().url = url_clone.clone();
+            self.tab_mut().title = filename.clone();
+            self.tab_mut().url = url.clone();
             self.tab_mut().images = vec![crate::tab::ImageRef {
-                src: url_clone, alt: filename.to_string(), line: 0, height: reserve,
+                src: url, alt: filename, line: 0, height: reserve,
             }];
         } else if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
             let width = self.main.w as usize;
@@ -454,6 +494,7 @@ impl App {
         self.render_all();
         // Start async image downloads for the page
         self.start_image_downloads();
+        self.check_autofill();
     }
 
     fn go_back(&mut self) {
@@ -494,24 +535,27 @@ impl App {
         self.focus_index = -1;
         self.render_all();
         self.start_image_downloads();
+        self.check_autofill();
     }
 
     // --- Scrolling ---
 
     fn scroll_down(&mut self, n: usize) {
-        self.clear_images();
+        let old_ix = self.tabs[self.current_tab].ix;
         self.tabs[self.current_tab].ix += n;
         self.main.ix = self.tabs[self.current_tab].ix;
-        self.main.full_refresh();
-        if self.conf.show_images { self.show_visible_images(); }
+        let delta = (self.tabs[self.current_tab].ix - old_ix) as i32;
+        self.main.scroll_refresh(delta);
+        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
     }
 
     fn scroll_up(&mut self, n: usize) {
-        self.clear_images();
-        self.tabs[self.current_tab].ix = self.tabs[self.current_tab].ix.saturating_sub(n);
+        let old_ix = self.tabs[self.current_tab].ix;
+        self.tabs[self.current_tab].ix = old_ix.saturating_sub(n);
         self.main.ix = self.tabs[self.current_tab].ix;
-        self.main.full_refresh();
-        if self.conf.show_images { self.show_visible_images(); }
+        let delta = -((old_ix - self.tabs[self.current_tab].ix) as i32);
+        self.main.scroll_refresh(delta);
+        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
     }
 
     fn page_down(&mut self) {
@@ -525,13 +569,12 @@ impl App {
     }
 
     fn scroll_bottom(&mut self) {
-        self.clear_images();
         let lc = self.tab().content.lines().count();
         let page = self.main.h as usize;
         self.tabs[self.current_tab].ix = lc.saturating_sub(page);
         self.main.ix = self.tabs[self.current_tab].ix;
-        self.main.full_refresh();
-        if self.conf.show_images { self.show_visible_images(); }
+        self.main.refresh();
+        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
     }
 
     // --- Tabs ---
@@ -819,16 +862,12 @@ impl App {
     // --- Clipboard ---
 
     fn copy_url(&self) {
-        let url = &self.tab().url;
-        print!("\x1b]52;c;{}\x07", base64_encode(url.as_bytes()));
-        std::io::Write::flush(&mut std::io::stdout()).ok();
+        crust::clipboard_copy(&self.tab().url, "clipboard");
     }
 
     fn copy_focused_url(&self) {
         if self.focus_index >= 0 && (self.focus_index as usize) < self.tab().links.len() {
-            let href = &self.tab().links[self.focus_index as usize].href;
-            print!("\x1b]52;c;{}\x07", base64_encode(href.as_bytes()));
-            std::io::Write::flush(&mut std::io::stdout()).ok();
+            crust::clipboard_copy(&self.tab().links[self.focus_index as usize].href, "clipboard");
         }
     }
 
@@ -1003,6 +1042,9 @@ impl App {
   Tab/S-Tab     Next/prev link or field\n\
   Enter         Follow link / edit field\n\
   f             Fill and submit form\n\
+  e             Edit page source in $EDITOR\n\
+  C-G           Edit form field in $EDITOR\n\
+  p             Show password for site\n\
   y             Copy page URL\n\
   Y             Copy focused link URL\n\n\
 {}\n\
@@ -1019,7 +1061,10 @@ impl App {
   P             Preferences\n\
   C-L           Force redraw\n\
   :             Command mode\n\
-  q             Quit",
+  q             Quit\n\n\
+{}\n\
+  :password     Save credentials for site\n\
+  :adblock      Update ad block list",
             style::bold("Scroll - Terminal Web Browser"),
             style::fg("Scrolling", 220),
             style::fg("Navigation", 220),
@@ -1028,6 +1073,7 @@ impl App {
             style::fg("Search", 220),
             style::fg("Bookmarks", 220),
             style::fg("Other", 220),
+            style::fg("Commands", 220),
         );
         self.tab_mut().content = help;
         self.tab_mut().ix = 0;
@@ -1126,6 +1172,8 @@ impl App {
                     }
                 }
             }
+            "password" | "pw" => { self.save_password_cmd(); }
+            "adblock" => { self.update_adblock(); }
             _ => { self.status.say(&style::fg(&format!(" Unknown command: {}", command), 196)); }
         }
     }
@@ -1150,9 +1198,179 @@ impl App {
         Crust::clear_screen();
         self.render_all();
     }
+
+    // --- Edit source ---
+
+    fn edit_source(&mut self) {
+        let url = self.tab().url.clone();
+        if url.starts_with("about:") { return; }
+        let result = self.fetcher.fetch(&url, "GET", None);
+        if result.status != 200 { return; }
+
+        let tmpfile = format!("/tmp/scroll_edit_{}.html", std::process::id());
+        if std::fs::write(&tmpfile, &result.body).is_err() { return; }
+
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        Crust::cleanup();
+        let _ = std::process::Command::new(&editor).arg(&tmpfile).status();
+        Crust::init();
+        Crust::clear_screen();
+
+        if let Ok(edited) = std::fs::read_to_string(&tmpfile) {
+            let width = self.main.w as usize;
+            let rendered = renderer::render_html(&edited, width, &url, &self.conf);
+            self.tab_mut().content = rendered.text;
+            self.tab_mut().title = rendered.title;
+            self.tab_mut().links = rendered.links;
+            self.tab_mut().forms = rendered.forms;
+            self.tab_mut().images = rendered.images;
+            self.tab_mut().site_bg = rendered.site_bg;
+            self.tab_mut().site_fg = rendered.site_fg;
+            let _ = std::fs::remove_file(&tmpfile);
+        }
+        self.render_all();
+    }
+
+    // --- Edit form field ---
+
+    fn edit_form_field(&mut self) {
+        if self.tab().forms.is_empty() {
+            self.status.say(&style::fg(" No forms on page", 220));
+            return;
+        }
+        let form = &self.tab().forms[0];
+        let editable: Vec<(usize, String, String)> = form.fields.iter().enumerate()
+            .filter(|(_, f)| f.field_type != "hidden")
+            .map(|(i, f)| (i, f.name.clone(), f.value.clone()))
+            .collect();
+        if editable.is_empty() {
+            self.status.say(&style::fg(" No editable fields", 220));
+            return;
+        }
+        let field_idx = if editable.len() == 1 {
+            editable[0].0
+        } else {
+            let names: Vec<String> = editable.iter().enumerate()
+                .map(|(i, (_, name, _))| format!("{}: {}", i + 1, name))
+                .collect();
+            let input = self.status.ask_with_bg(&format!("Field ({}) #: ", names.join(", ")), "", 18);
+            if input.is_empty() { return; }
+            match input.parse::<usize>() {
+                Ok(n) if n >= 1 && n <= editable.len() => editable[n - 1].0,
+                _ => return,
+            }
+        };
+
+        let value = self.tab().forms[0].fields[field_idx].value.clone();
+        let tmpfile = format!("/tmp/scroll_field_{}.txt", std::process::id());
+        if std::fs::write(&tmpfile, &value).is_err() { return; }
+
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vim".into());
+        Crust::cleanup();
+        let _ = std::process::Command::new(&editor).arg(&tmpfile).status();
+        Crust::init();
+        Crust::clear_screen();
+
+        if let Ok(edited) = std::fs::read_to_string(&tmpfile) {
+            let name = self.tabs[self.current_tab].forms[0].fields[field_idx].name.clone();
+            self.tabs[self.current_tab].forms[0].fields[field_idx].value = edited.trim().to_string();
+            self.status.say(&style::fg(&format!(" Set {} from editor", name), 82));
+            let _ = std::fs::remove_file(&tmpfile);
+        }
+        self.render_all();
+    }
+
+    // --- Passwords ---
+
+    fn show_password(&mut self) {
+        let host = url::Url::parse(&self.tab().url).ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let Some(host) = host else {
+            self.status.say(&style::fg(" No host", 220));
+            return;
+        };
+        if let Some((user, pass)) = self.passwords.get(&host) {
+            self.status.say(&format!(" {} - user: {} pass: {}", host, user, pass));
+        } else {
+            self.status.say(&style::fg(&format!(" No password for {}", host), 220));
+        }
+    }
+
+    fn save_password_cmd(&mut self) {
+        let host = url::Url::parse(&self.tab().url).ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let Some(host) = host else {
+            self.status.say(&style::fg(" No host", 220));
+            return;
+        };
+        let user = self.status.ask_with_bg(&format!("Username for {}: ", host), "", 18);
+        if user.is_empty() { return; }
+        let pass = self.status.ask_with_bg(&format!("Password for {}: ", host), "", 18);
+        if pass.is_empty() { return; }
+        self.passwords.insert(host.clone(), (user, pass));
+        config::save_passwords(&self.passwords);
+        self.status.say(&style::fg(&format!(" Password saved for {}", host), 82));
+    }
+
+    fn check_autofill(&mut self) {
+        let has_pw_form = self.tab().forms.iter()
+            .any(|f| f.fields.iter().any(|ff| ff.field_type == "password"));
+        if !has_pw_form { return; }
+        let host = url::Url::parse(&self.tab().url).ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        if let Some(host) = host {
+            if self.passwords.contains_key(&host) {
+                self.status.say(&style::fg(
+                    &format!(" Credentials available for {}. Press 'f' to fill form.", host), 82));
+            }
+        }
+    }
+
+    // --- Ad blocking ---
+
+    fn update_adblock(&mut self) {
+        self.status.say(" Downloading adblock list...");
+        let result = self.fetcher.fetch(
+            "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+            "GET", None,
+        );
+        if result.status != 200 {
+            self.status.say(&style::fg(" Adblock update failed", 196));
+            return;
+        }
+        let mut domains = Vec::new();
+        for line in result.body.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && parts[0] == "0.0.0.0" && parts[1] != "0.0.0.0" {
+                domains.push(parts[1].to_string());
+            }
+        }
+        let _ = std::fs::write(config::adblock_path(), domains.join("\n"));
+        let count = domains.len();
+        self.adblock_domains = domains.into_iter().collect();
+        self.status.say(&style::fg(&format!(" Adblock updated: {} domains blocked", count), 82));
+    }
+
+    fn is_blocked(&self, url: &str) -> bool {
+        if self.adblock_domains.is_empty() { return false; }
+        url::Url::parse(url).ok()
+            .and_then(|u| u.host_str().map(|h| self.adblock_domains.contains(h)))
+            .unwrap_or(false)
+    }
 }
 
 // --- Helpers ---
+
+fn load_adblock() -> HashSet<String> {
+    std::fs::read_to_string(config::adblock_path())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
 
 fn img_cache_path(src: &str) -> String {
     format!("/tmp/scroll_img_{}", src.replace('/', "_").replace(':', "_").replace('?', "_"))
@@ -1194,22 +1412,6 @@ fn urlencoding(s: &str) -> String {
             b' ' => result.push('+'),
             _ => result.push_str(&format!("%{:02X}", b)),
         }
-    }
-    result
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[(n >> 18 & 63) as usize] as char);
-        result.push(CHARS[(n >> 12 & 63) as usize] as char);
-        if chunk.len() > 1 { result.push(CHARS[(n >> 6 & 63) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(CHARS[(n & 63) as usize] as char); } else { result.push('='); }
     }
     result
 }

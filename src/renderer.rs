@@ -1,8 +1,18 @@
 use crate::tab::{Link, Form, FormField, ImageRef};
 use crust::style;
 use scraper::{Html, ElementRef, Node};
+use std::sync::OnceLock;
 
 const IMG_RESERVE: usize = 10;
+
+// Pre-compiled CSS selectors (compiled once, reused across all renders)
+fn sel_title() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("title").unwrap()) }
+fn sel_body() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("body").unwrap()) }
+fn sel_img() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("img").unwrap()) }
+fn sel_option() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("option").unwrap()) }
+fn sel_tr() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("tr").unwrap()) }
+fn sel_td_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("td, th").unwrap()) }
+fn sel_style() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("style").unwrap()) }
 
 pub struct RenderResult {
     pub text: String,
@@ -14,20 +24,63 @@ pub struct RenderResult {
     pub site_fg: Option<u8>,
 }
 
-/// Highlight a specific link index in rendered content by wrapping its line in reverse
+/// Highlight a specific link index in rendered content by reversing only the link text
 pub fn highlight_link(content: &str, links: &[Link], focus_idx: usize) -> String {
     if focus_idx >= links.len() { return content.to_string(); }
     let target_line = links[focus_idx].line;
     let link_text = &links[focus_idx].text;
+    let link_idx = links[focus_idx].index;
+    // Build the decorated link string that appears in rendered content: "text[N]"
+    let marker = format!("[{}]", link_idx);
     content.lines().enumerate().map(|(i, line)| {
         if i == target_line {
-            // Wrap the focused link text in reverse
             let plain = crust::strip_ansi(line);
             if plain.contains(link_text.as_str()) {
-                style::reverse(line)
-            } else {
-                line.to_string()
+                // Replace the link text with reversed version, keeping rest of line intact
+                // Find the link text in the plain version to locate it
+                if let Some(pos) = plain.find(link_text.as_str()) {
+                    // Find end of link marker (text + [N])
+                    let end = if let Some(mp) = plain[pos..].find(&marker) {
+                        pos + mp + marker.len()
+                    } else {
+                        pos + link_text.len()
+                    };
+                    // Rebuild: prefix (with ANSI) + reversed link + suffix (with ANSI)
+                    // Use character-level rebuild to handle ANSI codes
+                    let mut result = String::new();
+                    let mut visible = 0;
+                    let mut in_escape = false;
+                    let mut in_link = false;
+                    let mut link_buf = String::new();
+                    for ch in line.chars() {
+                        if ch == '\x1b' { in_escape = true; }
+                        if in_escape {
+                            if in_link { link_buf.push(ch); } else { result.push(ch); }
+                            if ch.is_ascii_alphabetic() { in_escape = false; }
+                            continue;
+                        }
+                        if visible == pos && !in_link {
+                            in_link = true;
+                        }
+                        if in_link {
+                            link_buf.push(ch);
+                            visible += 1;
+                            if visible == end {
+                                result.push_str(&style::reverse(&link_buf));
+                                in_link = false;
+                            }
+                        } else {
+                            result.push(ch);
+                            visible += 1;
+                        }
+                    }
+                    if in_link {
+                        result.push_str(&style::reverse(&link_buf));
+                    }
+                    return result;
+                }
             }
+            line.to_string()
         } else {
             line.to_string()
         }
@@ -53,15 +106,14 @@ pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::confi
     };
 
     let title = doc.root_element()
-        .select(&scraper::Selector::parse("title").unwrap())
+        .select(sel_title())
         .next()
         .map(|t| t.text().collect::<String>().trim().to_string())
         .unwrap_or_default();
 
     let (site_bg, site_fg) = extract_site_colors(&doc, html);
 
-    let body_sel = scraper::Selector::parse("body").unwrap();
-    if let Some(body) = doc.select(&body_sel).next() {
+    if let Some(body) = doc.select(sel_body()).next() {
         walk_element(&body, &mut ctx);
     } else {
         walk_element(&doc.root_element(), &mut ctx);
@@ -218,8 +270,7 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             let resolved = resolve_url(&ctx.base_url, href);
 
             // Check if link contains an image
-            let img_sel = scraper::Selector::parse("img").unwrap();
-            let has_img = el.select(&img_sel).next().is_some();
+            let has_img = el.select(sel_img()).next().is_some();
 
             // Ensure space before link if text precedes it
             if ctx.col > ctx.indent && !ctx.current_line.ends_with(' ') {
@@ -331,8 +382,7 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
         "select" => {
             let name = el.value().attr("name").unwrap_or("").to_string();
             let line = ctx.lines.len();
-            let opt_sel = scraper::Selector::parse("option").unwrap();
-            let options: Vec<(String, String)> = el.select(&opt_sel)
+            let options: Vec<(String, String)> = el.select(sel_option())
                 .map(|opt| {
                     let val = opt.value().attr("value").unwrap_or("").to_string();
                     let label = opt.text().collect::<String>().trim().to_string();
@@ -461,11 +511,9 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
-    let row_sel = scraper::Selector::parse("tr").unwrap();
-    let cell_sel = scraper::Selector::parse("td, th").unwrap();
     let mut rows: Vec<Vec<String>> = Vec::new();
-    for row in el.select(&row_sel) {
-        let cells: Vec<String> = row.select(&cell_sel)
+    for row in el.select(sel_tr()) {
+        let cells: Vec<String> = row.select(sel_td_th())
             .map(|c| c.text().collect::<String>().trim().to_string())
             .collect();
         if !cells.is_empty() { rows.push(cells); }
@@ -526,14 +574,12 @@ fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
 }
 
 fn extract_site_colors(doc: &Html, _html: &str) -> (Option<u8>, Option<u8>) {
-    let body_sel = scraper::Selector::parse("body").unwrap();
-    if let Some(body) = doc.select(&body_sel).next() {
+    if let Some(body) = doc.select(sel_body()).next() {
         if let Some(bg) = body.value().attr("bgcolor") {
             return (parse_color(bg), body.value().attr("text").and_then(parse_color));
         }
     }
-    let style_sel = scraper::Selector::parse("style").unwrap();
-    for s in doc.select(&style_sel) {
+    for s in doc.select(sel_style()) {
         let css = s.text().collect::<String>();
         if let Some(bg) = extract_css_color(&css, "background-color")
             .or_else(|| extract_css_color(&css, "background")) {
@@ -554,26 +600,12 @@ fn extract_css_color(css: &str, prop: &str) -> Option<String> {
 fn parse_color(s: &str) -> Option<u8> {
     let s = s.trim();
     if s.starts_with('#') {
-        let hex = &s[1..];
-        let (r, g, b) = if hex.len() == 6 {
-            (u8::from_str_radix(&hex[0..2], 16).ok()?, u8::from_str_radix(&hex[2..4], 16).ok()?, u8::from_str_radix(&hex[4..6], 16).ok()?)
-        } else if hex.len() == 3 {
-            (u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()?, u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()?, u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()?)
-        } else { return None; };
-        return Some(rgb_to_xterm(r, g, b));
+        let (r, g, b) = crust::style::parse_hex_color(s)?;
+        return Some(crust::style::rgb_to_xterm(r, g, b));
     }
     match s.to_lowercase().as_str() {
         "white" => Some(255), "black" => Some(0), "red" => Some(196),
         "green" => Some(46), "blue" => Some(21), "yellow" => Some(226),
         _ => None,
     }
-}
-
-fn rgb_to_xterm(r: u8, g: u8, b: u8) -> u8 {
-    if r == g && g == b {
-        if r < 8 { return 16; }
-        if r > 248 { return 231; }
-        return (((r as u16 - 8) * 24 / 247) as u8) + 232;
-    }
-    16 + 36 * (r as u8 / 51) + 6 * (g as u8 / 51) + (b as u8 / 51)
 }
