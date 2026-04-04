@@ -393,7 +393,26 @@ impl App {
         self.tab_mut().navigate(&resolved);
         let result = self.fetcher.fetch(&resolved, "GET", None);
 
-        if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
+        if result.content_type.starts_with("image/") {
+            // Image URL: download as binary and display
+            let cache_path = img_cache_path(&result.url);
+            if !std::path::Path::new(&cache_path).exists() {
+                if let Some(bytes) = self.fetcher.fetch_bytes(&result.url) {
+                    let _ = std::fs::write(&cache_path, &bytes);
+                }
+            }
+            let filename = result.url.rsplit('/').next().unwrap_or("image");
+            self.tab_mut().content = format!("\n\n{}\n\n{}",
+                crust::style::fg(filename, 81),
+                crust::style::fg(&result.url, 245));
+            self.tab_mut().title = filename.to_string();
+            let url_clone = result.url.clone();
+            self.tab_mut().url = url_clone.clone();
+            // Add as image at line 0 so glow displays it
+            self.tab_mut().images = vec![crate::tab::ImageRef {
+                src: url_clone, alt: filename.to_string(), line: 0, height: 10,
+            }];
+        } else if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
             let width = self.main.w as usize;
             let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
             self.tab_mut().content = rendered.text;
@@ -404,6 +423,17 @@ impl App {
             self.tab_mut().url = result.url;
             self.tab_mut().site_bg = rendered.site_bg;
             self.tab_mut().site_fg = rendered.site_fg;
+        } else if result.content_type.starts_with("application/pdf")
+            || result.content_type.starts_with("application/zip")
+            || result.content_type.starts_with("audio/")
+            || result.content_type.starts_with("video/") {
+            // Binary files: offer to download
+            let filename = resolved.rsplit('/').next().unwrap_or("file");
+            self.tab_mut().content = format!("\n{}\n\nType: {}\n\nPress ':download {}' to save",
+                crust::style::bold(filename),
+                result.content_type,
+                resolved);
+            self.tab_mut().title = filename.to_string();
         } else {
             self.tab_mut().content = result.body;
             self.tab_mut().title = resolved.clone();
