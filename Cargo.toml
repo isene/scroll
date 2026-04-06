@@ -1,6 +1,6 @@
 [package]
 name = "scroll"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Terminal web browser with vim keybindings. Feature clone of brrowser."
