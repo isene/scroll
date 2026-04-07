@@ -410,6 +410,16 @@ impl App {
         self.clear_images();
         let resolved = resolve_search(url, &self.conf.search_engine);
 
+        // Handle mailto: links - open in Kastrup
+        if resolved.starts_with("mailto:") {
+            Crust::cleanup();
+            let _ = std::process::Command::new("kastrup").arg(&resolved).status();
+            Crust::init();
+            Crust::clear_screen();
+            self.handle_resize();
+            return;
+        }
+
         // Handle about: URLs
         if resolved == "about:blank" {
             self.tab_mut().navigate(&resolved);
