@@ -124,7 +124,7 @@ fn main() {
             "PgUP" => { app.page_up(); }
             "g" => { app.g_pressed = true; }
             "G" | "END" => { app.scroll_bottom(); }
-            "HOME" => { app.main.ix = 0; app.render_main(); }
+            "HOME" => { app.tabs[app.current_tab].ix = 0; app.main.ix = 0; app.render_main(); }
             "C-D" => { app.scroll_down(app.rows as usize / 2); }
             "C-U" => { app.scroll_up(app.rows as usize / 2); }
             "<" => { if app.h_scroll >= 10 { app.h_scroll -= 10; } else { app.h_scroll = 0; } app.render_main(); }
@@ -257,12 +257,12 @@ impl App {
 
         self.main.set_text(&tab.content);
         self.main.ix = tab.ix;
+        // full_refresh redraws the text cells but kitty graphics are an
+        // overlay — we have to delete the old placements explicitly or
+        // they linger behind the new content.
+        if self.conf.show_images { self.clear_images(); }
         self.main.full_refresh();
-
-        // Show images in viewport
-        if self.conf.show_images {
-            self.show_visible_images();
-        }
+        if self.conf.show_images { self.show_visible_images(); }
     }
 
     /// Start async download of all images on the page
@@ -551,21 +551,29 @@ impl App {
     // --- Scrolling ---
 
     fn scroll_down(&mut self, n: usize) {
+        // Kitty's classic image placements scroll with the terminal's
+        // DEC scroll region, so if we let scroll_refresh run first the
+        // graphics ride along and only THEN get deleted + re-placed —
+        // producing the illusion that the image stayed pinned to its
+        // original screen row. Clear images BEFORE the scroll, then
+        // re-place from scratch once the text has settled.
+        if self.conf.show_images { self.clear_images(); }
         let old_ix = self.tabs[self.current_tab].ix;
         self.tabs[self.current_tab].ix += n;
         self.main.ix = self.tabs[self.current_tab].ix;
         let delta = (self.tabs[self.current_tab].ix - old_ix) as i32;
         self.main.scroll_refresh(delta);
-        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
+        if self.conf.show_images { self.show_visible_images(); }
     }
 
     fn scroll_up(&mut self, n: usize) {
+        if self.conf.show_images { self.clear_images(); }
         let old_ix = self.tabs[self.current_tab].ix;
         self.tabs[self.current_tab].ix = old_ix.saturating_sub(n);
         self.main.ix = self.tabs[self.current_tab].ix;
         let delta = -((old_ix - self.tabs[self.current_tab].ix) as i32);
         self.main.scroll_refresh(delta);
-        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
+        if self.conf.show_images { self.show_visible_images(); }
     }
 
     fn page_down(&mut self) {
@@ -579,12 +587,13 @@ impl App {
     }
 
     fn scroll_bottom(&mut self) {
+        if self.conf.show_images { self.clear_images(); }
         let lc = self.tab().content.lines().count();
         let page = self.main.h as usize;
         self.tabs[self.current_tab].ix = lc.saturating_sub(page);
         self.main.ix = self.tabs[self.current_tab].ix;
         self.main.refresh();
-        if self.conf.show_images { self.clear_images(); self.show_visible_images(); }
+        if self.conf.show_images { self.show_visible_images(); }
     }
 
     // --- Tabs ---
