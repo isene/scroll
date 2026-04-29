@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "crossterm",
  "libc",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "scroll"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "fe2o3-crust",
  "fe2o3-glow",
