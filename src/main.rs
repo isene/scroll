@@ -52,6 +52,7 @@ fn main() {
     let initial_url = std::env::args().nth(1).unwrap_or_else(|| "about:home".into());
 
     Crust::init();
+    Crust::set_app_identity("Scroll");
     let (cols, rows) = Crust::terminal_size();
 
     let conf = Config::load();
