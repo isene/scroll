@@ -714,6 +714,12 @@ impl App {
             if js.localstorage_dirty && !host.is_empty() {
                 config::save_localstorage(&set_name, &host, &js.localstorage);
             }
+            // Hand JS-set field values to the form-fill path via the
+            // tab — so a hidden input populated by inline JS rides
+            // along on submit.
+            if !js.dom_values.is_empty() {
+                self.tab_mut().js_dom_values = js.dom_values.clone();
+            }
             if let Some(target) = js.redirect {
                 if !target.is_empty() && target != result.url {
                     let resolved = renderer::resolve_url(&result.url, &target);
@@ -1214,16 +1220,31 @@ impl App {
         let creds: Option<(String, String)> = host.as_ref().and_then(|h| self.lookup_password(h));
 
         for field in &form.fields {
+            // JS-typed value for this field (by element id) takes
+            // precedence over the static value attribute. Lets a
+            // field that an inline script populated from a cookie or
+            // a fetch() ride along on submit.
+            let js_value: Option<String> = if field.id.is_empty() {
+                None
+            } else {
+                self.tab().js_dom_values.get(&field.id).cloned()
+            };
             match field.field_type.as_str() {
-                "hidden" => { params.insert(field.name.clone(), field.value.clone()); }
+                "hidden" => {
+                    let v = js_value.unwrap_or_else(|| field.value.clone());
+                    params.insert(field.name.clone(), v);
+                }
                 "password" => {
-                    let default = creds.as_ref().map(|(_, p)| p.clone()).unwrap_or_default();
+                    let default = js_value
+                        .or_else(|| creds.as_ref().map(|(_, p)| p.clone()))
+                        .unwrap_or_default();
                     let val = self.prompt(&format!("{}: ", field.name), &default);
                     params.insert(field.name.clone(), val);
                 }
                 "select" => {
                     let options: Vec<String> = field.options.iter().map(|(_, l)| l.clone()).collect();
-                    let val = self.prompt(&format!("{} ({}): ", field.name, options.join("/")), "");
+                    let default = js_value.unwrap_or_default();
+                    let val = self.prompt(&format!("{} ({}): ", field.name, options.join("/")), &default);
                     params.insert(field.name.clone(), val);
                 }
                 _ => {
@@ -1233,7 +1254,9 @@ impl App {
                     let autofill = creds.as_ref()
                         .filter(|_| is_userish)
                         .map(|(u, _)| u.clone());
-                    let default = autofill.unwrap_or_else(|| field.value.clone());
+                    let default = js_value
+                        .or(autofill)
+                        .unwrap_or_else(|| field.value.clone());
                     let val = self.prompt(&format!("{}: ", field.placeholder), &default);
                     params.insert(field.name.clone(), val);
                 }

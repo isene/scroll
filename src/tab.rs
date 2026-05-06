@@ -12,6 +12,11 @@ pub struct Tab {
     pub forward_history: Vec<HistoryEntry>,
     pub site_bg: Option<u8>,
     pub site_fg: Option<u8>,
+    /// JS-set element values, keyed by element id. Populated when
+    /// the page's JS calls `document.getElementById(...).value =
+    /// "..."`. Form-fill consults this so a hidden CSRF input the
+    /// JS populated from a cookie still rides along on submit.
+    pub js_dom_values: std::collections::HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -30,10 +35,11 @@ pub struct Form {
     pub line: usize,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FormField {
     pub field_type: String,
     pub name: String,
+    pub id: String,
     pub value: String,
     pub placeholder: String,
     pub options: Vec<(String, String)>, // for select: (value, label)
@@ -68,6 +74,7 @@ impl Tab {
             forward_history: Vec::new(),
             site_bg: None,
             site_fg: None,
+            js_dom_values: std::collections::HashMap::new(),
         }
     }
 

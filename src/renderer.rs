@@ -349,13 +349,14 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
         "input" => {
             let itype = el.value().attr("type").unwrap_or("text").to_lowercase();
             let name = el.value().attr("name").unwrap_or("").to_string();
+            let id = el.value().attr("id").unwrap_or("").to_string();
             let value = el.value().attr("value").unwrap_or("").to_string();
             let placeholder = el.value().attr("placeholder").unwrap_or(&name).to_string();
             let line = ctx.lines.len();
             match itype.as_str() {
                 "hidden" => {
                     if let Some(form) = ctx.forms.last_mut() {
-                        form.fields.push(FormField { field_type: "hidden".into(), name, value, placeholder: String::new(), options: Vec::new(), line });
+                        form.fields.push(FormField { field_type: "hidden".into(), name, id, value, line, ..Default::default() });
                     }
                 }
                 "submit" => {
@@ -365,14 +366,14 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
                 }
                 "password" => {
                     if let Some(form) = ctx.forms.last_mut() {
-                        form.fields.push(FormField { field_type: "password".into(), name, value, placeholder: placeholder.clone(), options: Vec::new(), line });
+                        form.fields.push(FormField { field_type: "password".into(), name, id, value, placeholder: placeholder.clone(), line, ..Default::default() });
                     }
                     ctx.append(&style::fg(&format!("[{}: \u{25CF}\u{25CF}\u{25CF}\u{25CF}]", placeholder), 252));
                     ctx.newline();
                 }
                 _ => {
                     if let Some(form) = ctx.forms.last_mut() {
-                        form.fields.push(FormField { field_type: itype, name, value, placeholder: placeholder.clone(), options: Vec::new(), line });
+                        form.fields.push(FormField { field_type: itype, name, id, value, placeholder: placeholder.clone(), line, ..Default::default() });
                     }
                     ctx.append(&style::fg(&format!("[{}: ________]", placeholder), 252));
                     ctx.newline();
@@ -381,6 +382,7 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
         }
         "select" => {
             let name = el.value().attr("name").unwrap_or("").to_string();
+            let id = el.value().attr("id").unwrap_or("").to_string();
             let line = ctx.lines.len();
             let options: Vec<(String, String)> = el.select(sel_option())
                 .map(|opt| {
@@ -390,9 +392,9 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
                 }).collect();
             if let Some(form) = ctx.forms.last_mut() {
                 form.fields.push(FormField {
-                    field_type: "select".into(), name: name.clone(),
+                    field_type: "select".into(), name: name.clone(), id,
                     value: options.first().map(|o| o.0.clone()).unwrap_or_default(),
-                    placeholder: String::new(), options, line,
+                    options, line, ..Default::default()
                 });
             }
             ctx.append(&style::fg(&format!("[{} \u{25BC}]", name), 252));
@@ -400,12 +402,13 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
         }
         "textarea" => {
             let name = el.value().attr("name").unwrap_or("").to_string();
+            let id = el.value().attr("id").unwrap_or("").to_string();
             let line = ctx.lines.len();
             let text = el.text().collect::<String>();
             if let Some(form) = ctx.forms.last_mut() {
                 form.fields.push(FormField {
-                    field_type: "textarea".into(), name: name.clone(),
-                    value: text, placeholder: String::new(), options: Vec::new(), line,
+                    field_type: "textarea".into(), name: name.clone(), id,
+                    value: text, line, ..Default::default()
                 });
             }
             ctx.append(&style::fg(&format!("[{}: ________]", name), 252));

@@ -1,32 +1,45 @@
 //! Minimal JS execution layer over scroll's text-mode renderer.
 //!
-//! After a page is fetched, scroll extracts inline `<script>` tags
-//! and runs them in a `boa` context that exposes a stub DOM and
-//! `window` object. The goal is "make simple JS work" — not "ship a
-//! browser". Currently supported:
+//! After a page is fetched, scroll extracts every `<script>` tag
+//! (inline + external) and runs them in a `boa` context that exposes
+//! a small DOM, `window`, `fetch`, storage, and cookies. Goal:
+//! "make simple JS work" — not "ship a browser". Currently supported:
 //!
-//! - `console.log` / `console.error` / `console.warn` (captured into
-//!   the `JsResult.log`).
-//! - `navigator.userAgent` returns a Chrome-shaped string so sites
-//!   that gate on UA don't reject us outright.
-//! - `window.location` and `document.location` — read URL components,
-//!   write to `href` to request a navigation.
-//! - `localStorage` / `sessionStorage` (in-process, per JsContext).
-//! - `setTimeout` / `setInterval` no-op stubs that return ids; we
-//!   don't run an event loop.
-//! - `document.getElementById` / `document.querySelector` etc.
-//!   return `null` for now (no real DOM yet). Most JS that does
-//!   feature-detection treats `null` as "do nothing".
+//! - `console.log/.warn/.error/.info` captured into `JsResult.log`.
+//! - `navigator.userAgent` (Chrome-shaped), `.language`, `.platform`.
+//! - `window.location` / `document.location`: read URL components,
+//!   write to `href` / call `assign` / `replace` to redirect.
+//! - `document.cookie` real read/write against the active set's jar.
+//! - `localStorage` (per-set, per-origin, persisted to disk between
+//!   runs) + `sessionStorage` (per-run only).
+//! - `document.getElementById` / `document.querySelector` (subset:
+//!   `#id`, bare-tag) return Element handles backed by `JsState.dom`.
+//!   Element accessor properties: `value`, `innerHTML`, `textContent`,
+//!   `checked`, `tagName`. Methods: `getAttribute` / `setAttribute`,
+//!   plus no-op `click` / `submit` / `focus` / `blur` /
+//!   `dispatchEvent` / `addEventListener`. JS-set values surface
+//!   back via `JsResult.dom_values`.
+//! - `fetch(url, opts)` runs synchronously through ureq, sends the
+//!   active set's cookies, captures `Set-Cookie` from the response.
+//!   Returns a Response-shaped object with `.status` / `.ok` /
+//!   `.text()` / `.json()`. Each method returns a thenable so
+//!   `.then()` chains flow synchronously.
+//! - External `<script src=...>` fetched in document order with the
+//!   active set's cookies. Bounded: max 16 scripts, 1 MB total,
+//!   5-second per-fetch timeout.
+//! - `setTimeout` / `setInterval` no-op stubs that return ids.
 //!
 //! Boa 0.20's `from_copy_closure` requires `Copy` on captured state,
-//! so per-script-run mutable state lives behind a `thread_local!`
-//! slot that closures dip into. JS execution is synchronous and
-//! single-threaded, so this is safe.
+//! so per-run mutable state lives behind a `thread_local!` slot.
+//! Object-bound state (response body, element id, thenable value) is
+//! stashed as `__body` / `__id` / `__value` data properties on the
+//! JS object the closure operates on. JS execution is synchronous
+//! and single-threaded, so this is safe.
 //!
-//! Not yet supported: real DOM mutation, event listeners, async XHR /
-//! fetch, reCAPTCHA-style fingerprinting. The path to "Google login
-//! works" is the per-set Firefox profile import (Phase 1), not
-//! pretending scroll is Chrome.
+//! Not yet supported: live DOM tree, event-listener firing,
+//! `async/await` resumption, reCAPTCHA-style fingerprinting. For
+//! sites whose JS the minimal DOM can't satisfy, `:browse` bounces
+//! to the active set's Firefox profile.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -59,6 +72,25 @@ pub struct JsResult {
     /// says whether to persist to disk.
     pub localstorage: HashMap<String, String>,
     pub localstorage_dirty: bool,
+    /// DOM-element values touched by JS, keyed by element id. After
+    /// the page renders, the form-submit path can use these to
+    /// override field values that JS set programmatically (e.g. a
+    /// hidden CSRF input the JS populates from a cookie).
+    pub dom_values: HashMap<String, String>,
+    pub dom_dirty: bool,
+}
+
+/// One element's mutable state, addressed by its id attribute. Only
+/// elements that JS interacts with end up in the dom map; we don't
+/// maintain a full live DOM tree.
+#[derive(Default, Clone, Debug)]
+struct ElementState {
+    tag: String,
+    value: String,
+    checked: bool,
+    inner_html: String,
+    text_content: String,
+    attributes: HashMap<String, String>,
 }
 
 /// Per-page state collected during script execution.
@@ -80,6 +112,16 @@ struct JsState {
     local_storage: HashMap<String, String>,
     local_storage_dirty: bool,
     session_storage: HashMap<String, String>,
+    /// DOM elements addressable by id. Pre-populated from the parsed
+    /// HTML before scripts run, then mutated as JS sets .value /
+    /// .innerHTML / etc.
+    dom: HashMap<String, ElementState>,
+    dom_dirty: bool,
+    /// Page host (without scheme/path) — used by fetch() to decide
+    /// which cookies and which Origin header to send.
+    page_host: String,
+    /// Page URL — used by fetch() to resolve relative URLs.
+    page_url: String,
 }
 
 thread_local! {
@@ -111,7 +153,12 @@ pub fn run_scripts(
     cookies_in: HashMap<String, String>,
     localstorage_in: HashMap<String, String>,
 ) -> JsResult {
-    let scripts = extract_inline_scripts(html);
+    let host = url::Url::parse(page_url).ok()
+        .and_then(|u| u.host_str().map(|h| h.to_string()))
+        .unwrap_or_default();
+    let dom = parse_dom(html);
+
+    let scripts = extract_scripts_in_order(html, page_url, &cookies_in);
     if scripts.is_empty() {
         return JsResult {
             cookies: cookies_in,
@@ -126,21 +173,14 @@ pub fn run_scripts(
         *st = JsState::default();
         st.cookies = cookies_in;
         st.local_storage = localstorage_in;
+        st.dom = dom;
+        st.page_host = host;
+        st.page_url = page_url.to_string();
     });
 
     let mut ctx = Context::default();
     if install_globals(&mut ctx, page_url).is_err() {
-        return STATE.with(|s| {
-            let st = s.borrow();
-            JsResult {
-                log: st.log.clone(),
-                redirect: st.redirect.clone(),
-                cookies: st.cookies.clone(),
-                cookies_dirty: st.cookies_dirty,
-                localstorage: st.local_storage.clone(),
-                localstorage_dirty: st.local_storage_dirty,
-            }
-        });
+        return finish_run();
     }
 
     for src in scripts {
@@ -152,8 +192,16 @@ pub fn run_scripts(
         }
     }
 
+    finish_run()
+}
+
+fn finish_run() -> JsResult {
     STATE.with(|s| {
         let st = s.borrow();
+        let dom_values: HashMap<String, String> = st.dom.iter()
+            .filter(|(_, e)| !e.value.is_empty())
+            .map(|(id, e)| (id.clone(), e.value.clone()))
+            .collect();
         JsResult {
             log: st.log.clone(),
             redirect: st.redirect.clone(),
@@ -161,36 +209,136 @@ pub fn run_scripts(
             cookies_dirty: st.cookies_dirty,
             localstorage: st.local_storage.clone(),
             localstorage_dirty: st.local_storage_dirty,
+            dom_values,
+            dom_dirty: st.dom_dirty,
         }
     })
 }
 
-fn extract_inline_scripts(html: &str) -> Vec<String> {
-    // Lightweight extractor — we don't want to parse HTML twice.
-    // Looks for `<script>...</script>` blocks where the opening tag
-    // has no `src=` attribute. Case-insensitive on the tag name.
+/// Parse the HTML once with scraper, populate ElementState entries
+/// for every element that has an `id` attribute. JS reaches into
+/// these via getElementById. Elements without ids are queryable by
+/// other selectors (handled separately) but not stored here.
+fn parse_dom(html: &str) -> HashMap<String, ElementState> {
+    let doc = scraper::Html::parse_document(html);
+    let mut map = HashMap::new();
+    let sel = match scraper::Selector::parse("[id]") { Ok(s) => s, Err(_) => return map };
+    for el in doc.select(&sel) {
+        let id = match el.value().attr("id") { Some(s) => s.to_string(), None => continue };
+        let tag = el.value().name().to_string();
+        let value = el.value().attr("value").unwrap_or("").to_string();
+        let mut attrs = HashMap::new();
+        for (k, v) in el.value().attrs() {
+            attrs.insert(k.to_string(), v.to_string());
+        }
+        let checked = attrs.contains_key("checked");
+        let inner_html = el.inner_html();
+        let text_content: String = el.text().collect::<Vec<_>>().join("");
+        map.insert(id, ElementState {
+            tag, value, checked, inner_html, text_content, attributes: attrs,
+        });
+    }
+    map
+}
+
+/// Extract every script source on the page in document order:
+/// inline ones become their literal body; external `<script src=...>`
+/// ones are fetched via a fresh ureq request scoped with the
+/// caller-provided cookies. Bounded so a malicious page can't
+/// spawn unbounded fetches: max 16 scripts, max 1 MB total bytes,
+/// 5-second per-fetch timeout.
+fn extract_scripts_in_order(html: &str, page_url: &str, cookies: &HashMap<String, String>) -> Vec<String> {
+    const MAX_SCRIPTS: usize = 16;
+    const MAX_TOTAL_BYTES: usize = 1_048_576;
     let mut out = Vec::new();
+    let mut total = 0usize;
     let lower = html.to_ascii_lowercase();
     let mut i = 0usize;
     while let Some(start) = lower[i..].find("<script") {
+        if out.len() >= MAX_SCRIPTS { break; }
         let s = i + start;
         let tag_end = match lower[s..].find('>') { Some(e) => s + e, None => break };
-        let opening = &lower[s..=tag_end];
-        // Skip external scripts entirely.
-        if opening.contains("src=") {
-            i = tag_end + 1;
-            continue;
-        }
+        let opening = &html[s..=tag_end];
         let body_start = tag_end + 1;
-        let close = match lower[body_start..].find("</script>") {
-            Some(c) => body_start + c,
+        let close_rel = match lower[body_start..].find("</script>") {
+            Some(c) => c,
             None => break,
         };
-        out.push(html[body_start..close].to_string());
+        let close = body_start + close_rel;
+        let body = &html[body_start..close];
+
+        // External vs inline.
+        if let Some(src_url) = parse_src_attr(opening) {
+            let resolved = absolute_url(page_url, &src_url);
+            if let Some(content) = fetch_script(&resolved, cookies, MAX_TOTAL_BYTES.saturating_sub(total)) {
+                total += content.len();
+                out.push(content);
+            }
+        } else if !body.trim().is_empty() {
+            if total + body.len() > MAX_TOTAL_BYTES { break; }
+            total += body.len();
+            out.push(body.to_string());
+        }
+
         i = close + "</script>".len();
     }
     out
 }
+
+fn parse_src_attr(opening_tag: &str) -> Option<String> {
+    let lower = opening_tag.to_ascii_lowercase();
+    let key = "src=";
+    let pos = lower.find(key)?;
+    let rest = &opening_tag[pos + key.len()..];
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    let (start, end_char) = match bytes.first() {
+        Some(b'"') => (1usize, '"'),
+        Some(b'\'') => (1usize, '\''),
+        _ => (0usize, ' '),
+    };
+    let tail = &rest[start..];
+    let end = tail.find(|c: char| c == end_char || (end_char == ' ' && (c == '>' || c.is_whitespace()))).unwrap_or(tail.len());
+    let val = &tail[..end];
+    if val.is_empty() { None } else { Some(val.to_string()) }
+}
+
+fn absolute_url(base: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("//") {
+        if let Some(stripped) = href.strip_prefix("//") {
+            return format!("https:{}{}", "//", stripped);
+        }
+        return href.to_string();
+    }
+    if let Ok(b) = url::Url::parse(base) {
+        if let Ok(u) = b.join(href) {
+            return u.to_string();
+        }
+    }
+    href.to_string()
+}
+
+fn fetch_script(url: &str, cookies: &HashMap<String, String>, budget: usize) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(5))
+        .redirects(5)
+        .build();
+    let mut req = agent.get(url)
+        .set("User-Agent", "scroll/0.2 (terminal browser)")
+        .set("Accept", "*/*");
+    if !cookies.is_empty() {
+        let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
+        req = req.set("Cookie", &cs);
+    }
+    let resp = req.call().ok()?;
+    let mut body = String::new();
+    use std::io::Read;
+    let mut reader = resp.into_reader().take(budget as u64);
+    reader.read_to_string(&mut body).ok()?;
+    Some(body)
+}
+
 
 fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
     // ---------- console ----------
@@ -271,18 +419,74 @@ fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
         .build();
     ctx.register_global_property(js_string!("window"), window, Attribute::all())?;
 
-    // ---------- document (stub queries + working cookie property) ----------
+    // ---------- document (real-ish getElementById + cookie property) ----------
+    // getElementById / querySelector return a stub Element object
+    // backed by JsState.dom — mutations to .value, .innerHTML, etc.
+    // flow back to the host via JsResult.dom_values.
+    let get_by_id = NativeFunction::from_copy_closure(|_t, args, ctx| {
+        let id = args.first().and_then(|v| v.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        if id.is_empty() { return Ok(JsValue::null()); }
+        let exists = STATE.with(|s| s.borrow().dom.contains_key(&id));
+        if !exists { return Ok(JsValue::null()); }
+        let obj = make_element_object(ctx, &id)?;
+        Ok(JsValue::from(obj))
+    });
+    // querySelector with a tiny subset: "#id", ".class" returns first
+    // element matching, "tag" returns first matching tag. For
+    // anything fancier returns null (caller's feature-detect handles).
+    let query_selector = NativeFunction::from_copy_closure(|_t, args, ctx| {
+        let sel = args.first().and_then(|v| v.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        let matched_id = STATE.with(|s| -> Option<String> {
+            let st = s.borrow();
+            if let Some(id) = sel.strip_prefix('#') {
+                if st.dom.contains_key(id) { return Some(id.to_string()); }
+                return None;
+            }
+            // tag name selector
+            if !sel.contains([' ', '.', '#', '[', '>']) {
+                let want = sel.to_ascii_lowercase();
+                return st.dom.iter().find(|(_, e)| e.tag.eq_ignore_ascii_case(&want))
+                    .map(|(k, _)| k.clone());
+            }
+            None
+        });
+        match matched_id {
+            Some(id) => Ok(JsValue::from(make_element_object(ctx, &id)?)),
+            None => Ok(JsValue::null()),
+        }
+    });
     let document = ObjectInitializer::new(ctx)
-        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::null())),
-                  js_string!("getElementById"), 1)
-        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::null())),
-                  js_string!("querySelector"), 1)
+        .function(get_by_id, js_string!("getElementById"), 1)
+        .function(query_selector, js_string!("querySelector"), 1)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("querySelectorAll"), 1)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("addEventListener"), 2)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("removeEventListener"), 2)
+        .function(NativeFunction::from_copy_closure(|_t, args, ctx| {
+            // createElement: return a fresh anonymous element. id is
+            // assigned lazily if the caller sets one.
+            let tag = args.first().and_then(|v| v.to_string(ctx).ok())
+                .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let id = STATE.with(|s| {
+                let mut st = s.borrow_mut();
+                let mut n = 0u32;
+                loop {
+                    let candidate = format!("__anon_{}", n);
+                    if !st.dom.contains_key(&candidate) {
+                        st.dom.insert(candidate.clone(), ElementState {
+                            tag: tag.clone(), ..Default::default()
+                        });
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            });
+            Ok(JsValue::from(make_element_object(ctx, &id)?))
+        }), js_string!("createElement"), 1)
         .build();
     // document.cookie: getter returns "k=v; k=v" for the current host's
     // cookies; setter parses a single cookie attribute string and stores
@@ -340,7 +544,348 @@ fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
     ctx.register_global_callable(js_string!("clearInterval"), 0,
         NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())))?;
 
+    // ---------- fetch ----------
+    // Synchronous-but-pretends-thenable. Real fetch is async; here
+    // the network call blocks inside the closure and the returned
+    // object exposes .then(cb) that immediately invokes `cb(self)`.
+    // That covers the common patterns:
+    //
+    //   fetch(url).then(r => r.json()).then(data => ...)
+    //   fetch(url, {method:"POST", body, headers}).then(...)
+    //
+    // It does NOT cover code that puts fetch behind an `await` in an
+    // async function and expects the rest of the function to resume
+    // — boa's async machinery is heavier, and this gets us most of
+    // the way for login-form-style flows.
+    ctx.register_global_callable(js_string!("fetch"), 1,
+        NativeFunction::from_copy_closure(|_t, args, ctx| {
+            let url = args.first()
+                .and_then(|v| v.to_string(ctx).ok())
+                .map(|s| s.to_std_string_escaped())
+                .unwrap_or_default();
+            let opts = args.get(1).cloned();
+            do_fetch(ctx, &url, opts)
+        }))?;
+
     Ok(())
+}
+
+/// Perform a synchronous fetch and return a Response-shaped object.
+fn do_fetch(ctx: &mut Context, url: &str, opts: Option<JsValue>) -> BoaResult<JsValue> {
+    let (page_url, cookies) = STATE.with(|s| {
+        let st = s.borrow();
+        (st.page_url.clone(), st.cookies.clone())
+    });
+    let absolute = absolute_url(&page_url, url);
+
+    // Pull method / body / headers off the options bag.
+    let mut method = "GET".to_string();
+    let mut body: Option<String> = None;
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if let Some(JsValue::Object(o)) = opts {
+        if let Ok(m) = o.get(js_string!("method"), ctx) {
+            if let Ok(s) = m.to_string(ctx) {
+                let s = s.to_std_string_escaped();
+                if !s.is_empty() { method = s.to_uppercase(); }
+            }
+        }
+        if let Ok(b) = o.get(js_string!("body"), ctx) {
+            if !b.is_undefined() && !b.is_null() {
+                if let Ok(s) = b.to_string(ctx) {
+                    body = Some(s.to_std_string_escaped());
+                }
+            }
+        }
+        if let Ok(h) = o.get(js_string!("headers"), ctx) {
+            if let JsValue::Object(hobj) = h {
+                if let Ok(keys) = hobj.own_property_keys(ctx) {
+                    for key in keys {
+                        let name = key.to_string();
+                        if let Ok(val) = hobj.get(key, ctx) {
+                            if let Ok(vs) = val.to_string(ctx) {
+                                headers.push((name, vs.to_std_string_escaped()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(10))
+        .redirects(5)
+        .build();
+    let mut req = match method.as_str() {
+        "POST" => agent.post(&absolute),
+        "PUT" => agent.put(&absolute),
+        "DELETE" => agent.delete(&absolute),
+        _ => agent.get(&absolute),
+    };
+    req = req.set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
+    for (k, v) in &headers { req = req.set(k, v); }
+    if !cookies.is_empty() {
+        let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
+        req = req.set("Cookie", &cs);
+    }
+
+    let resp = match body {
+        Some(b) => req.send_string(&b),
+        None => req.call(),
+    };
+    let (status, body_text, set_cookie) = match resp {
+        Ok(r) => {
+            let status = r.status();
+            let sc = r.header("set-cookie").map(String::from);
+            let body = r.into_string().unwrap_or_default();
+            (status, body, sc)
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            (code, body, None)
+        }
+        Err(e) => {
+            record_log("error", &format!("fetch {} failed: {}", absolute, e));
+            (0, String::new(), None)
+        }
+    };
+
+    // Capture any Set-Cookie header into our cookie state so the JS
+    // consequence of the fetch is visible to subsequent document.cookie
+    // reads and persisted to the host's jar.
+    if let Some(val) = set_cookie {
+        if let Some((name_val, _)) = val.split_once(';') {
+            if let Some((name, value)) = name_val.split_once('=') {
+                STATE.with(|s| {
+                    let mut st = s.borrow_mut();
+                    st.cookies.insert(name.trim().to_string(), value.trim().to_string());
+                    st.cookies_dirty = true;
+                });
+            }
+        }
+    }
+
+    // The Response object stashes its body string as `__body` so the
+    // text() / json() closures (which must be Copy and therefore
+    // can't capture a String) read it back off `this`.
+    let resp_obj = ObjectInitializer::new(ctx)
+        .property(js_string!("status"), JsValue::Integer(status as i32), Attribute::all())
+        .property(js_string!("ok"), JsValue::Boolean((200..300).contains(&status)), Attribute::all())
+        .property(js_string!("statusText"), js_string!(""), Attribute::all())
+        .property(js_string!("url"), js_string!(absolute.clone()), Attribute::all())
+        .property(js_string!("__body"), js_string!(body_text), Attribute::all())
+        .function(NativeFunction::from_copy_closure(|t, _args, ctx| {
+            let body = read_body(t, ctx);
+            make_thenable(ctx, JsValue::from(js_string!(body)))
+        }), js_string!("text"), 0)
+        .function(NativeFunction::from_copy_closure(|t, _args, ctx| {
+            let body = read_body(t, ctx);
+            let parsed = ctx.eval(Source::from_bytes(format!("({})", body).as_bytes()))
+                .unwrap_or(JsValue::null());
+            make_thenable(ctx, parsed)
+        }), js_string!("json"), 0)
+        .build();
+
+    // The fetch() return value is itself thenable: .then(cb) calls
+    // cb(response) synchronously and rewraps the result.
+    make_thenable(ctx, JsValue::from(resp_obj))
+}
+
+fn read_body(this: &JsValue, ctx: &mut Context) -> String {
+    let obj = match this.as_object() { Some(o) => o, None => return String::new() };
+    obj.get(js_string!("__body"), ctx).ok()
+        .and_then(|v| v.to_string(ctx).ok())
+        .map(|s| s.to_std_string_escaped())
+        .unwrap_or_default()
+}
+
+/// Wrap a value in a `{ __value, then(cb) { return cb(__value) } }`
+/// style object so chained `.then()` calls flow synchronously. The
+/// closure reads `__value` off `this`, sidestepping boa's
+/// `Fn + Copy` capture restriction.
+fn make_thenable(ctx: &mut Context, value: JsValue) -> BoaResult<JsValue> {
+    let then = NativeFunction::from_copy_closure(|t, args, ctx| {
+        // Pull the wrapped value off `this`.
+        let value = match t.as_object()
+            .and_then(|o| o.get(js_string!("__value"), ctx).ok())
+        {
+            Some(v) => v,
+            None => JsValue::undefined(),
+        };
+        let cb = match args.first() {
+            Some(JsValue::Object(f)) if f.is_callable() => f.clone(),
+            _ => return make_thenable(ctx, value),
+        };
+        let result = match cb.call(&JsValue::undefined(), &[value], ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                record_log("error", &format!("then callback threw: {}", e));
+                JsValue::undefined()
+            }
+        };
+        make_thenable(ctx, result)
+    });
+    let obj = ObjectInitializer::new(ctx)
+        .property(js_string!("__value"), value, Attribute::all())
+        .function(then, js_string!("then"), 1)
+        .build();
+    Ok(JsValue::from(obj))
+}
+
+/// Build a JS Element object addressable by `id`. The element's
+/// dynamic properties (`value`, `innerHTML`, `textContent`,
+/// `checked`, `id`, `tagName`) are accessor properties that read /
+/// write through `STATE.dom[<id>]`. `__id` is a private-ish data
+/// property the accessors use to know which element they belong to.
+fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsObject> {
+    use boa_engine::property::PropertyDescriptor;
+    let realm = ctx.realm().clone();
+
+    // tagName getter
+    let tag_get = NativeFunction::from_copy_closure(|t, _args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let v = STATE.with(|s| s.borrow().dom.get(&id).map(|e| e.tag.to_uppercase()).unwrap_or_default());
+        Ok(JsValue::from(js_string!(v)))
+    }).to_js_function(&realm);
+
+    // value get/set
+    let value_get = NativeFunction::from_copy_closure(|t, _args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let v = STATE.with(|s| s.borrow().dom.get(&id).map(|e| e.value.clone()).unwrap_or_default());
+        Ok(JsValue::from(js_string!(v)))
+    }).to_js_function(&realm);
+    let value_set = NativeFunction::from_copy_closure(|t, args, ctx| {
+        let id = element_id(t).unwrap_or_default();
+        let new_val = args.first().and_then(|v| v.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.dom.entry(id).or_default().value = new_val;
+            st.dom_dirty = true;
+        });
+        Ok(JsValue::undefined())
+    }).to_js_function(&realm);
+
+    // innerHTML get/set
+    let inner_get = NativeFunction::from_copy_closure(|t, _args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let v = STATE.with(|s| s.borrow().dom.get(&id).map(|e| e.inner_html.clone()).unwrap_or_default());
+        Ok(JsValue::from(js_string!(v)))
+    }).to_js_function(&realm);
+    let inner_set = NativeFunction::from_copy_closure(|t, args, ctx| {
+        let id = element_id(t).unwrap_or_default();
+        let new_val = args.first().and_then(|v| v.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.dom.entry(id).or_default().inner_html = new_val;
+            st.dom_dirty = true;
+        });
+        Ok(JsValue::undefined())
+    }).to_js_function(&realm);
+
+    // textContent get/set
+    let text_get = NativeFunction::from_copy_closure(|t, _args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let v = STATE.with(|s| s.borrow().dom.get(&id).map(|e| e.text_content.clone()).unwrap_or_default());
+        Ok(JsValue::from(js_string!(v)))
+    }).to_js_function(&realm);
+    let text_set = NativeFunction::from_copy_closure(|t, args, ctx| {
+        let id = element_id(t).unwrap_or_default();
+        let new_val = args.first().and_then(|v| v.to_string(ctx).ok())
+            .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+        STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.dom.entry(id).or_default().text_content = new_val;
+            st.dom_dirty = true;
+        });
+        Ok(JsValue::undefined())
+    }).to_js_function(&realm);
+
+    // checked get/set
+    let checked_get = NativeFunction::from_copy_closure(|t, _args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let v = STATE.with(|s| s.borrow().dom.get(&id).map(|e| e.checked).unwrap_or(false));
+        Ok(JsValue::Boolean(v))
+    }).to_js_function(&realm);
+    let checked_set = NativeFunction::from_copy_closure(|t, args, _c| {
+        let id = element_id(t).unwrap_or_default();
+        let new_val = args.first().and_then(|v| v.as_boolean()).unwrap_or(false);
+        STATE.with(|s| {
+            let mut st = s.borrow_mut();
+            st.dom.entry(id).or_default().checked = new_val;
+            st.dom_dirty = true;
+        });
+        Ok(JsValue::undefined())
+    }).to_js_function(&realm);
+
+    let obj = ObjectInitializer::new(ctx)
+        .property(js_string!("__id"), js_string!(id.to_string()), Attribute::all())
+        .property(js_string!("id"), js_string!(id.to_string()), Attribute::all())
+        // No-op behaviour methods. .click() / .submit() / .focus() /
+        // .blur() / .dispatchEvent() — common form-validating JS calls
+        // these and treats the absence as "OK done".
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("click"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("submit"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("focus"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("blur"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::Boolean(true))),
+                  js_string!("dispatchEvent"), 1)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("addEventListener"), 2)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("removeEventListener"), 2)
+        // getAttribute / setAttribute backed by the attributes map.
+        .function(NativeFunction::from_copy_closure(|t, args, ctx| {
+            let id = element_id(t).unwrap_or_default();
+            let name = args.first().and_then(|v| v.to_string(ctx).ok())
+                .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let v = STATE.with(|s|
+                s.borrow().dom.get(&id).and_then(|e| e.attributes.get(&name).cloned()));
+            Ok(match v { Some(s) => JsValue::from(js_string!(s)), None => JsValue::null() })
+        }), js_string!("getAttribute"), 1)
+        .function(NativeFunction::from_copy_closure(|t, args, ctx| {
+            let id = element_id(t).unwrap_or_default();
+            let name = args.first().and_then(|v| v.to_string(ctx).ok())
+                .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            let val = args.get(1).and_then(|v| v.to_string(ctx).ok())
+                .map(|s| s.to_std_string_escaped()).unwrap_or_default();
+            STATE.with(|s| {
+                let mut st = s.borrow_mut();
+                st.dom.entry(id).or_default().attributes.insert(name, val);
+                st.dom_dirty = true;
+            });
+            Ok(JsValue::undefined())
+        }), js_string!("setAttribute"), 2)
+        .build();
+
+    let prop_accessor = |get, set| -> PropertyDescriptor {
+        PropertyDescriptor::builder()
+            .get(get).set(set).enumerable(true).configurable(true).build()
+    };
+    obj.define_property_or_throw(js_string!("tagName"),
+        PropertyDescriptor::builder().get(tag_get).enumerable(true).configurable(true).build(),
+        ctx)?;
+    obj.define_property_or_throw(js_string!("value"),     prop_accessor(value_get, value_set),     ctx)?;
+    obj.define_property_or_throw(js_string!("innerHTML"), prop_accessor(inner_get, inner_set),     ctx)?;
+    obj.define_property_or_throw(js_string!("textContent"), prop_accessor(text_get, text_set),     ctx)?;
+    obj.define_property_or_throw(js_string!("checked"),   prop_accessor(checked_get, checked_set), ctx)?;
+    Ok(obj)
+}
+
+/// Read the `__id` data property off a `this` JsValue used as a
+/// thin element handle. Returns None on any structural mismatch.
+fn element_id(this: &JsValue) -> Option<String> {
+    let obj = this.as_object()?;
+    let mut ctx = Context::default();
+    let v = obj.get(js_string!("__id"), &mut ctx).ok()?;
+    let s = v.to_string(&mut ctx).ok()?;
+    Some(s.to_std_string_escaped())
 }
 
 /// Build a `localStorage`-style object: getItem / setItem / removeItem
@@ -514,5 +1059,57 @@ mod tests {
         let html = r#"<script>console.log(navigator.userAgent)</script>"#;
         let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
         assert!(r.log.iter().any(|l| l.contains("Chrome")), "log: {:?}", r.log);
+    }
+}
+
+#[cfg(test)]
+mod dom_fetch_tests {
+    use super::*;
+
+    #[test]
+    fn get_element_by_id_returns_value() {
+        let html = r#"<html><body>
+            <input id="user" value="initial">
+            <script>
+              var el = document.getElementById("user");
+              console.log("tag:", el.tagName, "value:", el.value);
+              el.value = "typed-by-js";
+              console.log("after:", el.value);
+            </script>
+        </body></html>"#;
+        let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
+        assert!(r.log.iter().any(|l| l.contains("tag: INPUT")), "log: {:?}", r.log);
+        assert!(r.log.iter().any(|l| l.contains("value: initial")), "log: {:?}", r.log);
+        assert!(r.log.iter().any(|l| l.contains("after: typed-by-js")), "log: {:?}", r.log);
+        assert!(r.dom_dirty);
+        assert_eq!(r.dom_values.get("user").map(|s| s.as_str()), Some("typed-by-js"));
+    }
+
+    #[test]
+    fn get_element_by_id_missing_returns_null() {
+        let html = r#"<html><body><script>
+            var el = document.getElementById("nope");
+            console.log("isnull:", el === null);
+        </script></body></html>"#;
+        let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
+        assert!(r.log.iter().any(|l| l.contains("isnull: true")), "log: {:?}", r.log);
+    }
+
+    #[test]
+    fn fetch_then_chain_runs_synchronously() {
+        // Use httpbin alternative... actually just check that fetch
+        // returns a thenable and the chain runs without throwing.
+        // For an offline test we'd need a stub, so this exercises
+        // the failure path (host doesn't resolve) and asserts the
+        // chain still flows.
+        let html = r#"<script>
+            var got = null;
+            fetch("http://127.0.0.1:1/should-fail")
+              .then(r => { got = "first-then"; return "second"; })
+              .then(v => { console.log("chain:", got, v); });
+        </script>"#;
+        let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
+        // The chain should run regardless of network outcome.
+        assert!(r.log.iter().any(|l| l.contains("chain: first-then")), "log: {:?}", r.log);
     }
 }
