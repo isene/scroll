@@ -1,6 +1,6 @@
 [package]
 name = "scroll"
-version = "0.1.10"
+version = "0.2.0"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Terminal web browser with vim keybindings. Feature clone of brrowser."
@@ -20,3 +20,8 @@ url = "2"
 # Firefox profiles without depending on the system sqlite version.
 # Used for per-set identity import (Phase 1 of the JS path).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Pure-Rust JavaScript engine. Used to execute inline <script> tags
+# against a minimal DOM/window stub so simple JS-driven login forms,
+# fetch-based POSTs, and `window.location` redirects work inside
+# scroll. No native deps; ~5 MB compiled-in.
+boa_engine = "0.20"

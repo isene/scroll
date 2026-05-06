@@ -1,5 +1,6 @@
 mod config;
 mod fetcher;
+mod js;
 mod renderer;
 mod tab;
 
@@ -693,6 +694,19 @@ impl App {
     fn load_result(&mut self, result: fetcher::FetchResult) {
         let width = self.main.w as usize;
         if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
+            // Run inline <script> tags first so a JS-driven redirect
+            // (window.location.href = "...") gets honoured before the
+            // user sees the placeholder page. Capped at one hop per
+            // load to avoid infinite redirect loops.
+            let js = js::run_scripts(&result.body, &result.url);
+            if let Some(target) = js.redirect {
+                if !target.is_empty() && target != result.url {
+                    let resolved = renderer::resolve_url(&result.url, &target);
+                    self.status.say(&format!(" JS redirect → {}", &resolved));
+                    self.navigate(&resolved);
+                    return;
+                }
+            }
             let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
             self.tab_mut().content = rendered.text;
             self.tab_mut().title = rendered.title;
@@ -1564,6 +1578,7 @@ impl App {
             "   :password          save credentials for current site".into(),
             "   :adblock           update ad-block list".into(),
             "   :ffimport          re-import cookies from current set's FF profile".into(),
+            "   :browse / :ff      open current URL in Firefox (uses set's profile)".into(),
             String::new(),
             style::fg(" j/k or ↓/↑ scroll · ESC / q / ? close", 245),
         ];
@@ -1720,7 +1735,36 @@ impl App {
             "password" | "pw" => { self.save_password_cmd(); }
             "adblock" => { self.update_adblock(); }
             "ffimport" => { self.ffimport_cmd(); }
+            "browse" | "ff" => { self.browse_in_firefox(); }
             _ => { self.status.say(&style::fg(&format!(" Unknown command: {}", command), 196)); }
+        }
+    }
+
+    /// `:browse` (alias `:ff`) — open the current URL in Firefox,
+    /// targeting the active set's Firefox profile if one is mapped.
+    /// The escape hatch for sites whose JS scroll's minimal DOM
+    /// can't run (Google login, Trusted-Types-heavy SPAs, anything
+    /// that needs reCAPTCHA). Uses the same profile mapping as
+    /// `:ffimport`, so multi-account separation is preserved.
+    fn browse_in_firefox(&mut self) {
+        let url = self.tab().url.clone();
+        if url.is_empty() || url == "about:home" || url == "about:blank" {
+            self.status.say(&style::fg(" Nothing to browse — open a URL first", 220));
+            return;
+        }
+        let set_name = self.sets.get(self.current_set).cloned().unwrap_or_default();
+        let profile = self.conf.firefox_profiles.get(&set_name).cloned();
+        let mut cmd = std::process::Command::new("firefox");
+        if let Some(p) = profile.filter(|p| !p.is_empty()) {
+            cmd.arg("-P").arg(&p);
+        }
+        cmd.arg("--new-tab").arg(&url);
+        cmd.stdin(std::process::Stdio::null())
+           .stdout(std::process::Stdio::null())
+           .stderr(std::process::Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => self.status.say(&format!(" Opened in Firefox ({}): {}", set_name, url)),
+            Err(e) => self.status.say(&style::fg(&format!(" firefox spawn failed: {}", e), 196)),
         }
     }
 

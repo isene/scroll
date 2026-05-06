@@ -475,7 +475,7 @@ impl RenderContext<'_> {
     }
 }
 
-fn resolve_url(base: &str, href: &str) -> String {
+pub fn resolve_url(base: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") || href.starts_with("file://") {
         return href.to_string();
     }
