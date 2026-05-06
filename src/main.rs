@@ -720,6 +720,13 @@ impl App {
             if !js.dom_values.is_empty() {
                 self.tab_mut().js_dom_values = js.dom_values.clone();
             }
+            // Stash the captured console output and the extracted
+            // script bodies on the tab. The submit-time re-run uses
+            // the scripts (without re-fetching externals); :jslog
+            // surfaces the log for debugging.
+            self.tab_mut().js_log = js.log.clone();
+            self.tab_mut().js_scripts = js.scripts.clone();
+            self.tab_mut().raw_html = result.body.clone();
             if let Some(target) = js.redirect {
                 if !target.is_empty() && target != result.url {
                     let resolved = renderer::resolve_url(&result.url, &target);
@@ -1263,6 +1270,65 @@ impl App {
             }
         }
 
+        // Pre-submit JS hook: re-run the page's scripts with the
+        // user's typed values mirrored into the dom map, then fire
+        // a synthetic submit event. Listeners can call
+        // event.preventDefault() to abort. Skips the re-run when
+        // the page had no scripts (overwhelming majority of forms).
+        if !self.tab().js_scripts.is_empty() {
+            let host = url::Url::parse(&self.tab().url).ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .unwrap_or_default();
+            let cookies_in = self.fetcher.cookies_for_host(&host);
+            let set_name = self.fetcher.active_set_name().to_string();
+            let ls_in = config::load_localstorage(&set_name, &host);
+            // Mirror filled values into dom by element id (where the
+            // form field had one).
+            let mut pre_dom: HashMap<String, String> = HashMap::new();
+            for f in &form.fields {
+                if !f.id.is_empty() {
+                    if let Some(v) = params.get(&f.name) {
+                        pre_dom.insert(f.id.clone(), v.clone());
+                    }
+                }
+            }
+            // Form id (we don't track it on Form yet — pass empty so
+            // listeners on document/window still fire; element-level
+            // form listeners that registered against the form's id
+            // won't match).
+            let scripts = self.tab().js_scripts.clone();
+            let raw_html = self.tab().raw_html.clone();
+            let url_for_js = self.tab().url.clone();
+            let r = js::run_extracted(
+                scripts, &raw_html, &url_for_js,
+                cookies_in, ls_in, pre_dom, Some(String::new()),
+            );
+            // Persist any cookie / localStorage side-effects from
+            // the listener.
+            if r.cookies_dirty && !host.is_empty() {
+                self.fetcher.replace_cookies_for_host(&host, r.cookies);
+            }
+            if r.localstorage_dirty && !host.is_empty() {
+                config::save_localstorage(&set_name, &host, &r.localstorage);
+            }
+            if !r.log.is_empty() {
+                self.tab_mut().js_log.extend(r.log);
+            }
+            if r.submit_prevented {
+                self.status.say(&style::fg(" Submission cancelled by page JS (preventDefault)", 220));
+                return;
+            }
+            // A submit listener may also have re-typed field values;
+            // sync those back into params before navigating.
+            for f in &form.fields {
+                if !f.id.is_empty() {
+                    if let Some(v) = r.dom_values.get(&f.id) {
+                        params.insert(f.name.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
         let method = form.method.to_uppercase();
         let url = if method == "POST" {
             form.action.clone()
@@ -1617,6 +1683,7 @@ impl App {
             "   :adblock           update ad-block list".into(),
             "   :ffimport          re-import cookies from current set's FF profile".into(),
             "   :browse / :ff      open current URL in Firefox (uses set's profile)".into(),
+            "   :jslog             show captured console output for this page".into(),
             String::new(),
             style::fg(" j/k or ↓/↑ scroll · ESC / q / ? close", 245),
         ];
@@ -1774,8 +1841,93 @@ impl App {
             "adblock" => { self.update_adblock(); }
             "ffimport" => { self.ffimport_cmd(); }
             "browse" | "ff" => { self.browse_in_firefox(); }
+            "jslog" => { self.show_jslog(); }
             _ => { self.status.say(&style::fg(&format!(" Unknown command: {}", command), 196)); }
         }
+    }
+
+    /// `:jslog` — popup viewer for the page's captured console
+    /// output (console.log/.warn/.error/.info plus our own [error]
+    /// entries from script throws and submit-listener throws).
+    /// Lets you debug "why didn't this site work" without spinning
+    /// up a real browser.
+    fn show_jslog(&mut self) {
+        let log = self.tab().js_log.clone();
+        if log.is_empty() {
+            self.status.say(" JS log is empty for this page");
+            return;
+        }
+        let pw = (self.cols.saturating_sub(4)).min(120);
+        let ph = (self.rows.saturating_sub(4)).min(40);
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 252, 235);
+        popup.border = true;
+        popup.scroll = true;
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(" {}", style::fg(&style::bold("JS console"), 81)));
+        lines.push(String::new());
+        for entry in &log {
+            // Color by channel.
+            let colored = if entry.starts_with("[error]") {
+                style::fg(entry, 196)
+            } else if entry.starts_with("[warn]") {
+                style::fg(entry, 220)
+            } else if entry.starts_with("[info]") {
+                style::fg(entry, 81)
+            } else {
+                entry.clone()
+            };
+            lines.push(format!(" {}", colored));
+        }
+        lines.push(String::new());
+        lines.push(style::fg(" j/k or ↓/↑ scroll · ESC / q close", 245));
+
+        popup.set_text(&lines.join("\n"));
+        popup.ix = 0;
+        popup.border_refresh();
+        popup.full_refresh();
+
+        loop {
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" => break,
+                "j" | "DOWN" => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    if (popup.ix as u16) + view < total {
+                        popup.ix += 1;
+                        popup.full_refresh();
+                    }
+                }
+                "k" | "UP" => {
+                    if popup.ix > 0 { popup.ix -= 1; popup.full_refresh(); }
+                }
+                "PgDOWN" | " " => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    let step = view as usize;
+                    if (popup.ix as u16) + view < total {
+                        popup.ix = ((popup.ix + step) as u16).min(total.saturating_sub(view)) as usize;
+                        popup.full_refresh();
+                    }
+                }
+                "PgUP" => {
+                    let view = ph.saturating_sub(2) as usize;
+                    popup.ix = popup.ix.saturating_sub(view);
+                    popup.full_refresh();
+                }
+                "g" => { popup.ix = 0; popup.full_refresh(); }
+                "G" => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    popup.ix = total.saturating_sub(view) as usize;
+                    popup.full_refresh();
+                }
+                _ => {}
+            }
+        }
+        self.render_all();
     }
 
     /// `:browse` (alias `:ff`) — open the current URL in Firefox,

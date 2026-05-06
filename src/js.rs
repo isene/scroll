@@ -78,6 +78,14 @@ pub struct JsResult {
     /// hidden CSRF input the JS populates from a cookie).
     pub dom_values: HashMap<String, String>,
     pub dom_dirty: bool,
+    /// Inline + external script bodies extracted from the page in
+    /// document order. Saved on the tab so submit-time re-runs can
+    /// fire the same listener set without re-fetching externals.
+    pub scripts: Vec<String>,
+    /// True when a submit-event listener invoked `preventDefault()`
+    /// during a synthetic dispatch (re-run with `submit_form_id`).
+    /// The host should abort the form submission when this is true.
+    pub submit_prevented: bool,
 }
 
 /// One element's mutable state, addressed by its id attribute. Only
@@ -122,6 +130,17 @@ struct JsState {
     page_host: String,
     /// Page URL — used by fetch() to resolve relative URLs.
     page_url: String,
+    /// Registered event listeners. Keyed by (target_id, event_type)
+    /// where target_id is "" for window/document, or an element id.
+    /// Live for the duration of the boa Context only.
+    listeners: Vec<(String, String, boa_engine::JsValue)>,
+    /// Set true by a submit listener calling event.preventDefault().
+    submit_prevented: bool,
+    /// If Some, after all scripts run we synthesise a submit event
+    /// and dispatch it to listeners targeting this form id (or
+    /// to document/window listeners). `submit_prevented` records
+    /// whether anything called preventDefault().
+    submit_dispatch_target: Option<String>,
 }
 
 thread_local! {
@@ -135,6 +154,25 @@ fn record_log(channel: &str, msg: &str) {
 }
 fn set_redirect(target: String) {
     STATE.with(|s| s.borrow_mut().redirect = Some(target));
+}
+
+/// Record an addEventListener(type, fn) call for `target_id`.
+/// Listeners survive only as long as the boa Context that owns the
+/// JsFunction; the host calls `dispatch_submit` before that
+/// Context drops.
+fn register_listener(target_id: &str, args: &[JsValue], ctx: &mut Context) {
+    let event_type = match args.first().and_then(|v| v.to_string(ctx).ok()) {
+        Some(s) => s.to_std_string_escaped(),
+        None => return,
+    };
+    let callback = match args.get(1) {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    if !matches!(&callback, JsValue::Object(o) if o.is_callable()) { return; }
+    STATE.with(|s| {
+        s.borrow_mut().listeners.push((target_id.to_string(), event_type, callback));
+    });
 }
 
 /// Run every inline `<script>` in `html` against a freshly initialised
@@ -153,19 +191,46 @@ pub fn run_scripts(
     cookies_in: HashMap<String, String>,
     localstorage_in: HashMap<String, String>,
 ) -> JsResult {
+    let scripts = extract_scripts_in_order(html, page_url, &cookies_in);
+    run_extracted(scripts, html, page_url, cookies_in, localstorage_in,
+                  HashMap::new(), None)
+}
+
+/// Re-run a previously extracted set of scripts. Used at form-submit
+/// time so any `addEventListener("submit", ...)` listeners get a
+/// chance to fire (with the user's typed values pre-populated in
+/// the DOM) and can call `event.preventDefault()` to abort the
+/// submission. `pre_dom_values` populates element `value`s before
+/// scripts run; `submit_form_id` (if Some) triggers a synthetic
+/// submit dispatch after scripts have set up listeners.
+pub fn run_extracted(
+    scripts: Vec<String>,
+    html: &str,
+    page_url: &str,
+    cookies_in: HashMap<String, String>,
+    localstorage_in: HashMap<String, String>,
+    pre_dom_values: HashMap<String, String>,
+    submit_form_id: Option<String>,
+) -> JsResult {
     let host = url::Url::parse(page_url).ok()
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_default();
-    let dom = parse_dom(html);
+    let mut dom = parse_dom(html);
+    // Pre-populate element values from the host (form-fill path).
+    for (id, value) in &pre_dom_values {
+        dom.entry(id.clone()).or_default().value = value.clone();
+    }
 
-    let scripts = extract_scripts_in_order(html, page_url, &cookies_in);
     if scripts.is_empty() {
         return JsResult {
             cookies: cookies_in,
             localstorage: localstorage_in,
+            scripts: Vec::new(),
             ..Default::default()
         };
     }
+
+    let scripts_for_result = scripts.clone();
 
     // Reset thread-local state for this run.
     STATE.with(|s| {
@@ -176,23 +241,50 @@ pub fn run_scripts(
         st.dom = dom;
         st.page_host = host;
         st.page_url = page_url.to_string();
+        st.submit_dispatch_target = submit_form_id.clone();
     });
 
     let mut ctx = Context::default();
     if install_globals(&mut ctx, page_url).is_err() {
-        return finish_run();
+        STATE.with(|s| s.borrow_mut().listeners.clear());
+        let mut r = finish_run();
+        r.scripts = scripts_for_result;
+        return r;
     }
 
     for src in scripts {
         // Best-effort: a script that throws still lets the next one
-        // run, mirroring browser behaviour. Errors are captured as
-        // log entries so a future :jslog command can surface them.
+        // run, mirroring browser behaviour.
         if let Err(e) = ctx.eval(Source::from_bytes(src.as_bytes())) {
             record_log("error", &format!("{}", e));
         }
     }
 
-    finish_run()
+    // After all scripts are loaded, dispatch a synthetic submit
+    // event if the host requested one. This is the post-fill
+    // re-run path — listeners get to validate / cancel.
+    if submit_form_id.is_some() {
+        dispatch_submit(&mut ctx);
+    }
+
+    // CRITICAL: drop listener JsValues before the boa Context drops.
+    // The thread_local STATE outlives this function call; if we
+    // leave JsValues in STATE.listeners they get dropped on the
+    // NEXT run when STATE is reset, but by then the boa GC heap
+    // they reference is gone → use-after-free → SIGABRT.
+    STATE.with(|s| s.borrow_mut().listeners.clear());
+
+    let mut r = finish_run();
+    r.scripts = scripts_for_result;
+    r
+}
+
+/// Public, host-callable extractor: pulls inline + external scripts
+/// in document order, returns their bodies. Stored on the tab so
+/// the submit-time re-run doesn't have to re-fetch external
+/// scripts.
+pub fn extract_scripts(html: &str, page_url: &str, cookies: &HashMap<String, String>) -> Vec<String> {
+    extract_scripts_in_order(html, page_url, cookies)
 }
 
 fn finish_run() -> JsResult {
@@ -211,8 +303,56 @@ fn finish_run() -> JsResult {
             localstorage_dirty: st.local_storage_dirty,
             dom_values,
             dom_dirty: st.dom_dirty,
+            scripts: Vec::new(),  // filled in by run_extracted
+            submit_prevented: st.submit_prevented,
         }
     })
+}
+
+/// Synthesise a `submit` Event and call every "submit" listener that
+/// targets the current `submit_dispatch_target` form, plus any
+/// listeners registered on document/window. preventDefault() on the
+/// event flips `STATE.submit_prevented`.
+fn dispatch_submit(ctx: &mut Context) {
+    let target_id = STATE.with(|s| s.borrow().submit_dispatch_target.clone());
+    let listeners = STATE.with(|s| {
+        let st = s.borrow();
+        st.listeners.iter().filter_map(|(tgt, ev, fnv)| {
+            if ev != "submit" { return None; }
+            // Match: empty target_id means "any submit listener" (rare),
+            // "_document" / "_window" always fire, or exact form id match.
+            let fires = tgt.is_empty() || tgt == "_document" || tgt == "_window"
+                || target_id.as_deref() == Some(tgt.as_str());
+            if fires { Some(fnv.clone()) } else { None }
+        }).collect::<Vec<JsValue>>()
+    });
+    if listeners.is_empty() { return; }
+
+    // Build the synthetic event object: { type: "submit",
+    // preventDefault(), defaultPrevented }. preventDefault flips a
+    // thread_local flag because the Copy-bound closure can't capture
+    // local state.
+    let event = ObjectInitializer::new(ctx)
+        .property(js_string!("type"), js_string!("submit"), Attribute::all())
+        .property(js_string!("cancelable"), JsValue::Boolean(true), Attribute::all())
+        .property(js_string!("defaultPrevented"), JsValue::Boolean(false), Attribute::all())
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| {
+            STATE.with(|s| s.borrow_mut().submit_prevented = true);
+            Ok(JsValue::undefined())
+        }), js_string!("preventDefault"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("stopPropagation"), 0)
+        .build();
+    let event_val = JsValue::from(event);
+
+    for lstn in listeners {
+        if let JsValue::Object(fobj) = lstn {
+            if !fobj.is_callable() { continue; }
+            if let Err(e) = fobj.call(&JsValue::undefined(), &[event_val.clone()], ctx) {
+                record_log("error", &format!("submit listener threw: {}", e));
+            }
+        }
+    }
 }
 
 /// Parse the HTML once with scraper, populate ElementState entries
@@ -416,6 +556,12 @@ fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
                   js_string!("prompt"), 0)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::Boolean(false))),
                   js_string!("confirm"), 0)
+        .function(NativeFunction::from_copy_closure(|_t, args, ctx| {
+            register_listener("_window", args, ctx);
+            Ok(JsValue::undefined())
+        }), js_string!("addEventListener"), 2)
+        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
+                  js_string!("removeEventListener"), 2)
         .build();
     ctx.register_global_property(js_string!("window"), window, Attribute::all())?;
 
@@ -462,8 +608,12 @@ fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
         .function(query_selector, js_string!("querySelector"), 1)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("querySelectorAll"), 1)
-        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
-                  js_string!("addEventListener"), 2)
+        // document.addEventListener stores the listener under
+        // target_id "_document" so dispatch_submit can find it.
+        .function(NativeFunction::from_copy_closure(|_t, args, ctx| {
+            register_listener("_document", args, ctx);
+            Ok(JsValue::undefined())
+        }), js_string!("addEventListener"), 2)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("removeEventListener"), 2)
         .function(NativeFunction::from_copy_closure(|_t, args, ctx| {
@@ -836,8 +986,13 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
                   js_string!("blur"), 0)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::Boolean(true))),
                   js_string!("dispatchEvent"), 1)
-        .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
-                  js_string!("addEventListener"), 2)
+        // Element-level addEventListener: pull element id from `this.__id`
+        // so dispatch can match this listener to the right form.
+        .function(NativeFunction::from_copy_closure(|t, args, ctx| {
+            let id = element_id(t).unwrap_or_default();
+            register_listener(&id, args, ctx);
+            Ok(JsValue::undefined())
+        }), js_string!("addEventListener"), 2)
         .function(NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())),
                   js_string!("removeEventListener"), 2)
         // getAttribute / setAttribute backed by the attributes map.
@@ -1093,6 +1248,45 @@ mod dom_fetch_tests {
         </script></body></html>"#;
         let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
         assert!(r.log.iter().any(|l| l.contains("isnull: true")), "log: {:?}", r.log);
+    }
+
+    #[test]
+    fn submit_listener_can_prevent_default() {
+        let html = r#"<html><body>
+            <form id="login"><input id="user" name="user"></form>
+            <script>
+              document.addEventListener("submit", function(e) {
+                console.log("submit fired, target type:", e.type);
+                e.preventDefault();
+              });
+            </script>
+        </body></html>"#;
+        // First run: registers the listener via inline script.
+        let scripts = extract_scripts(html, "https://example.com/", &Default::default());
+        // Second (simulated submit-time) run: dispatch a synthetic submit.
+        let r = run_extracted(
+            scripts, html, "https://example.com/",
+            Default::default(), Default::default(),
+            Default::default(),
+            Some("login".to_string()),
+        );
+        assert!(r.submit_prevented, "log: {:?}", r.log);
+        assert!(r.log.iter().any(|l| l.contains("submit fired")), "log: {:?}", r.log);
+    }
+
+    #[test]
+    fn submit_dispatch_no_listener_is_noop() {
+        let html = r#"<html><body><form id="login"></form>
+            <script>console.log("no listener");</script>
+        </body></html>"#;
+        let scripts = extract_scripts(html, "https://example.com/", &Default::default());
+        let r = run_extracted(
+            scripts, html, "https://example.com/",
+            Default::default(), Default::default(),
+            Default::default(),
+            Some("login".to_string()),
+        );
+        assert!(!r.submit_prevented);
     }
 
     #[test]

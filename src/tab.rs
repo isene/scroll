@@ -17,6 +17,18 @@ pub struct Tab {
     /// "..."`. Form-fill consults this so a hidden CSRF input the
     /// JS populated from a cookie still rides along on submit.
     pub js_dom_values: std::collections::HashMap<String, String>,
+    /// Captured console output from the page's scripts. Surfaced via
+    /// `:jslog`. Accumulates across script runs on the same page;
+    /// cleared on navigation.
+    pub js_log: Vec<String>,
+    /// Inline + external script bodies extracted at load time.
+    /// Re-runs use the same bodies so submit handlers wired via
+    /// addEventListener fire with the user's typed values.
+    pub js_scripts: Vec<String>,
+    /// Raw HTML body at load time. Submit-time re-runs feed this
+    /// back into `js::run_extracted` so the DOM seed (id → element
+    /// map) reflects the actual page.
+    pub raw_html: String,
 }
 
 #[derive(Clone)]
@@ -75,6 +87,9 @@ impl Tab {
             site_bg: None,
             site_fg: None,
             js_dom_values: std::collections::HashMap::new(),
+            js_log: Vec::new(),
+            js_scripts: Vec::new(),
+            raw_html: String::new(),
         }
     }
 
