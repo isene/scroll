@@ -92,7 +92,15 @@ fn main() {
     }
     config::ensure_dirs();
 
-    let initial_url = std::env::args().nth(1).unwrap_or_else(|| "about:home".into());
+    // Two invocation modes:
+    //   `scroll`              → restore all sets and tabs from disk
+    //                            (`~/.scroll/session.json`).
+    //   `scroll <url>`        → ephemeral one-shot: a single tab in
+    //                            the default set, no session
+    //                            restore, no session save on exit.
+    let argv_url = std::env::args().nth(1);
+    let ephemeral = argv_url.is_some();
+    let initial_url = argv_url.clone().unwrap_or_else(|| "about:home".into());
 
     Crust::init();
     Crust::set_app_identity("Scroll");
@@ -156,10 +164,44 @@ fn main() {
         }
     }
 
-    // Create initial tab in the current set and navigate.
-    app.tabs.push(Tab::new("about:blank"));
-    app.tab_set.push(app.current_set);
-    app.navigate(&initial_url);
+    if ephemeral {
+        // Single-shot: one tab, no session restore.
+        app.tabs.push(Tab::new("about:blank"));
+        app.tab_set.push(app.current_set);
+        app.navigate(&initial_url);
+    } else if let Some(session) = config::load_session() {
+        // Restore tabs and sets from prior run. Each restored tab
+        // gets its target URL but only the active tab is fetched
+        // immediately; siblings load lazily when the user switches
+        // to them. Keeps startup fast even with many tabs.
+        if !session.tabs.is_empty() {
+            for snap in &session.tabs {
+                let mut t = Tab::new(&snap.url);
+                t.url = snap.url.clone();
+                app.tabs.push(t);
+                let max_set = app.sets.len().saturating_sub(1);
+                app.tab_set.push(snap.set.min(max_set));
+            }
+            let max_set = app.sets.len().saturating_sub(1);
+            let restored_set = session.current_set.min(max_set);
+            app.activate_set(restored_set);
+            app.current_tab = session.current_tab.min(app.tabs.len().saturating_sub(1));
+            // Fetch the active tab now; siblings will fetch on switch.
+            let url = app.tab().url.clone();
+            if !url.is_empty() && url != "about:blank" {
+                app.navigate(&url);
+            }
+        } else {
+            app.tabs.push(Tab::new("about:blank"));
+            app.tab_set.push(app.current_set);
+            app.navigate(&app.conf.homepage.clone());
+        }
+    } else {
+        // No session yet — open homepage.
+        app.tabs.push(Tab::new("about:blank"));
+        app.tab_set.push(app.current_set);
+        app.navigate(&app.conf.homepage.clone());
+    }
     app.render_all();
 
     while app.running {
@@ -268,6 +310,29 @@ fn main() {
 
             _ => {}
         }
+    }
+
+    // Persist sets + tabs for next launch — but ONLY when scroll
+    // was started without a URL argument. The ephemeral mode is
+    // explicitly "this one URL, then gone".
+    if !ephemeral {
+        let mut tabs_out = Vec::new();
+        let mut new_current = 0usize;
+        for (old_i, t) in app.tabs.iter().enumerate() {
+            // Skip transient placeholders. Keep everything else (including
+            // about:home) so explicit homepage tabs survive reload.
+            if t.url.is_empty() || t.url == "about:blank" { continue; }
+            let set = app.tab_set.get(old_i).copied().unwrap_or(0);
+            if old_i == app.current_tab {
+                new_current = tabs_out.len();
+            }
+            tabs_out.push(config::TabSnapshot { url: t.url.clone(), set });
+        }
+        config::save_session(&config::Session {
+            current_tab: new_current,
+            current_set: app.current_set,
+            tabs: tabs_out,
+        });
     }
 
     Crust::cleanup();
@@ -913,7 +978,23 @@ impl App {
         if in_set.len() <= 1 { return; }
         let pos = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
         self.current_tab = in_set[(pos + 1) % in_set.len()];
-        self.render_all();
+        self.lazy_load_or_render();
+    }
+
+    /// Either fetch + render the current tab if it's been restored
+    /// from session but never loaded, or just render. Lets restored
+    /// tabs come up the first time the user visits them rather than
+    /// hammering the network for every tab at startup.
+    fn lazy_load_or_render(&mut self) {
+        let needs_load = self.tab().content.is_empty()
+            && !self.tab().url.is_empty()
+            && self.tab().url != "about:blank";
+        if needs_load {
+            let url = self.tab().url.clone();
+            self.navigate(&url);
+        } else {
+            self.render_all();
+        }
     }
 
     fn prev_tab(&mut self) {
@@ -922,7 +1003,7 @@ impl App {
         let pos = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
         let n = in_set.len();
         self.current_tab = in_set[(pos + n - 1) % n];
-        self.render_all();
+        self.lazy_load_or_render();
     }
 
     fn close_tab(&mut self) {
@@ -974,6 +1055,7 @@ impl App {
         // Park current_tab on the first tab of the new set, if any.
         if let Some(&i) = self.tabs_in_current_set().first() {
             self.current_tab = i;
+            self.lazy_load_or_render();
         } else {
             // No tabs in this set yet — open one so the user can browse.
             self.tabs.push(Tab::new("about:blank"));
@@ -981,7 +1063,6 @@ impl App {
             self.current_tab = self.tabs.len() - 1;
             self.navigate(&self.conf.homepage.clone());
         }
-        self.render_all();
     }
 
     fn prev_set(&mut self) {
@@ -990,13 +1071,13 @@ impl App {
         self.activate_set((self.current_set + n - 1) % n);
         if let Some(&i) = self.tabs_in_current_set().first() {
             self.current_tab = i;
+            self.lazy_load_or_render();
         } else {
             self.tabs.push(Tab::new("about:blank"));
             self.tab_set.push(self.current_set);
             self.current_tab = self.tabs.len() - 1;
             self.navigate(&self.conf.homepage.clone());
         }
-        self.render_all();
     }
 
     fn rename_set(&mut self) {

@@ -56,6 +56,33 @@ pub fn load_localstorage(set_name: &str, host: &str) -> HashMap<String, String> 
         .unwrap_or_default()
 }
 
+pub fn session_path() -> PathBuf { scroll_dir().join("session.json") }
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TabSnapshot {
+    pub url: String,
+    pub set: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Session {
+    pub current_tab: usize,
+    pub current_set: usize,
+    pub tabs: Vec<TabSnapshot>,
+}
+
+pub fn load_session() -> Option<Session> {
+    fs::read_to_string(session_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+pub fn save_session(session: &Session) {
+    if let Ok(json) = serde_json::to_string_pretty(session) {
+        let _ = fs::write(session_path(), json);
+    }
+}
+
 pub fn save_localstorage(set_name: &str, host: &str, data: &HashMap<String, String>) {
     let p = localstorage_path(set_name, host);
     if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
