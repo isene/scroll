@@ -90,6 +90,34 @@ impl Fetcher {
         }
     }
 
+    /// Snapshot the cookies in the active jar that belong to the
+    /// exact `host` (no subdomain walk — JS only sees its own host's
+    /// cookies via `document.cookie`). Used by the JS layer.
+    pub fn cookies_for_host(&self, host: &str) -> std::collections::HashMap<String, String> {
+        self.jars.get(&self.active_set)
+            .and_then(|jar| jar.get(host))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replace this host's cookie map with `cookies` in the active
+    /// jar, then persist. Called after JS runs `document.cookie =`
+    /// writes so the next request includes the JS-set cookies.
+    pub fn replace_cookies_for_host(&mut self, host: &str, cookies: std::collections::HashMap<String, String>) {
+        let active = self.active_set.clone();
+        let jar = self.jars.entry(active).or_default();
+        if cookies.is_empty() {
+            jar.remove(host);
+        } else {
+            jar.insert(host.to_string(), cookies);
+        }
+        self.save_active_jar();
+    }
+
+    /// The active set's name. Used by the JS layer to scope per-set,
+    /// per-origin localStorage on disk.
+    pub fn active_set_name(&self) -> &str { &self.active_set }
+
     /// Import cookies from a Firefox profile into the currently
     /// active jar. `profile` may be a bare profile name (resolved
     /// against `~/.mozilla/firefox/profiles.ini`) or an absolute

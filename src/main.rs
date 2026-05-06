@@ -698,7 +698,22 @@ impl App {
             // (window.location.href = "...") gets honoured before the
             // user sees the placeholder page. Capped at one hop per
             // load to avoid infinite redirect loops.
-            let js = js::run_scripts(&result.body, &result.url);
+            // Snapshot the page-host cookies + load localStorage so
+            // JS sees a real document.cookie / localStorage. After
+            // execution, merge any JS-driven changes back.
+            let host = url::Url::parse(&result.url).ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                .unwrap_or_default();
+            let cookies_in = self.fetcher.cookies_for_host(&host);
+            let set_name = self.fetcher.active_set_name().to_string();
+            let ls_in = config::load_localstorage(&set_name, &host);
+            let js = js::run_scripts(&result.body, &result.url, cookies_in, ls_in);
+            if js.cookies_dirty && !host.is_empty() {
+                self.fetcher.replace_cookies_for_host(&host, js.cookies);
+            }
+            if js.localstorage_dirty && !host.is_empty() {
+                config::save_localstorage(&set_name, &host, &js.localstorage);
+            }
             if let Some(target) = js.redirect {
                 if !target.is_empty() && target != result.url {
                     let resolved = renderer::resolve_url(&result.url, &target);

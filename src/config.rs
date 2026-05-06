@@ -35,6 +35,38 @@ pub fn ensure_dirs() {
     let _ = fs::create_dir_all(cookies_dir());
 }
 
+/// Per-set, per-origin localStorage on disk. JS that stores tokens
+/// in localStorage now persists across scroll runs the way a real
+/// browser does.
+pub fn localstorage_path(set_name: &str, host: &str) -> PathBuf {
+    let safe_set: String = set_name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe_host: String = host.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    scroll_dir().join("localstorage").join(safe_set).join(format!("{}.json", safe_host))
+}
+
+pub fn load_localstorage(set_name: &str, host: &str) -> HashMap<String, String> {
+    let p = localstorage_path(set_name, host);
+    fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_localstorage(set_name: &str, host: &str, data: &HashMap<String, String>) {
+    let p = localstorage_path(set_name, host);
+    if let Some(parent) = p.parent() { let _ = fs::create_dir_all(parent); }
+    if data.is_empty() {
+        // Empty store → remove the file rather than leave a {} shell.
+        let _ = fs::remove_file(&p);
+    } else if let Ok(json) = serde_json::to_string_pretty(data) {
+        let _ = fs::write(&p, json);
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default = "default_homepage")]
