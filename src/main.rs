@@ -206,8 +206,8 @@ fn main() {
             "O" => { app.edit_url_prompt(); }
             "t" => { app.open_in_new_tab(); }
             "T" => { app.tabopen_focused(); }
-            "H" | "BACK" => { app.go_back(); }
-            "L" | "DEL" | "S-BACK" => { app.go_forward(); }
+            "H" | "BACK" | "C-DOWN" => { app.go_back(); }
+            "L" | "DEL" | "C-UP" => { app.go_forward(); }
             "r" => { app.reload(); }
 
             // Links & forms
@@ -727,6 +727,20 @@ impl App {
             self.tab_mut().js_log = js.log.clone();
             self.tab_mut().js_scripts = js.scripts.clone();
             self.tab_mut().raw_html = result.body.clone();
+
+            // ----- JS-driven content surfacing -----
+            // (A) innerHTML mutations: surgically replace each
+            //     element's content in the raw HTML and re-render.
+            //     Catches simple SPAs that do
+            //         document.getElementById("root").innerHTML = ...
+            // (B) Next.js / React Flight RSC payload: append the
+            //     extracted server-rendered text below the existing
+            //     page so a "Loading..." placeholder isn't the only
+            //     thing the user sees on a Next page.
+            let mut effective_html = result.body.clone();
+            if !js.inner_html_changes.is_empty() {
+                effective_html = apply_inner_html_changes(&effective_html, &js.inner_html_changes);
+            }
             if let Some(target) = js.redirect {
                 if !target.is_empty() && target != result.url {
                     let resolved = renderer::resolve_url(&result.url, &target);
@@ -735,7 +749,24 @@ impl App {
                     return;
                 }
             }
-            let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
+            // Append RSC-extracted text as a synthetic appended block.
+            // Wrapped in a <div> so the renderer treats it as a normal
+            // text run; preceded by an <hr> so the user sees it's a
+            // distinct "JS content" section.
+            if let Some(rsc) = &js.rsc_text {
+                let safe = rsc.replace('<', "&lt;").replace('>', "&gt;");
+                let block = format!(
+                    "<hr><div data-scroll-source=\"react-flight\"><pre>{}</pre></div>",
+                    safe,
+                );
+                // Insert just before </body> if present, else append.
+                if let Some(idx) = effective_html.to_ascii_lowercase().rfind("</body>") {
+                    effective_html.insert_str(idx, &block);
+                } else {
+                    effective_html.push_str(&block);
+                }
+            }
+            let rendered = renderer::render_html(&effective_html, width, &result.url, &self.conf);
             self.tab_mut().content = rendered.text;
             self.tab_mut().title = rendered.title;
             self.tab_mut().links = rendered.links;
@@ -1642,8 +1673,8 @@ impl App {
             format!(" {}", h("Navigation")),
             "   o                  open URL".into(),
             "   O                  edit current URL".into(),
-            "   H  /  Backspace    back".into(),
-            "   L  /  Delete       forward".into(),
+            "   H / Backspace / C-↓   back in history".into(),
+            "   L / Delete / C-↑      forward in history".into(),
             "   r                  reload".into(),
             String::new(),
             format!(" {}", h("Links & forms")),
@@ -2252,6 +2283,52 @@ fn resolve_search(input: &str, default_engine: &str) -> String {
         _ => "https://www.google.com/search?q=",
     };
     format!("{}{}", base, urlencoding(query))
+}
+
+/// Surgically swap the innerHTML of one or more `<tag id="X">…</tag>`
+/// blocks in `html`. Used after JS execution so a script that does
+/// `document.getElementById("root").innerHTML = "..."` actually
+/// shows up in the rendered text. Falls back to "no change" when an
+/// id isn't found so we never corrupt the markup.
+fn apply_inner_html_changes(html: &str, changes: &HashMap<String, String>) -> String {
+    let mut out = html.to_string();
+    for (id, new_inner) in changes {
+        if let Some((open_end, close_start)) = find_element_inner_range(&out, id) {
+            out.replace_range(open_end..close_start, new_inner);
+        }
+    }
+    out
+}
+
+/// Locate the byte range covering the `innerHTML` of the first
+/// element with `id="<wanted>"` in `html`. Returns `(open_end,
+/// close_start)` where slicing `html[open_end..close_start]` gives
+/// the inner content. Doesn't pretend to be a real HTML parser —
+/// good enough for the common case of `<div id="root">...</div>`
+/// where the open tag has no funky angle-brackets in attribute
+/// values.
+fn find_element_inner_range(html: &str, wanted_id: &str) -> Option<(usize, usize)> {
+    let needle1 = format!("id=\"{}\"", wanted_id);
+    let needle2 = format!("id='{}'", wanted_id);
+    let pos = html.find(&needle1).or_else(|| html.find(&needle2))?;
+    // Walk backwards to the opening '<' of this element.
+    let lt = html[..pos].rfind('<')?;
+    // Tag name = chars after '<' up to whitespace or '>'.
+    let after_lt = &html[lt + 1..];
+    let tag_end = after_lt.find(|c: char| c.is_whitespace() || c == '>' || c == '/')?;
+    let tag = &after_lt[..tag_end];
+    // Self-closing or void elements: bail.
+    let void = ["br", "img", "input", "hr", "meta", "link"];
+    if void.contains(&tag.to_ascii_lowercase().as_str()) { return None; }
+    // Find the end of the open tag.
+    let open_end = lt + 1 + after_lt.find('>')? + 1;
+    // Find the matching closing tag, naively (doesn't handle nested
+    // identical tags inside a string attribute, but those are rare).
+    let close_tag = format!("</{}>", tag);
+    let close_tag_lower = close_tag.to_ascii_lowercase();
+    let lower = html.to_ascii_lowercase();
+    let close_start = lower[open_end..].find(&close_tag_lower)? + open_end;
+    Some((open_end, close_start))
 }
 
 fn urlencoding(s: &str) -> String {

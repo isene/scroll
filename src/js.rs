@@ -86,6 +86,15 @@ pub struct JsResult {
     /// during a synthetic dispatch (re-run with `submit_form_id`).
     /// The host should abort the form submission when this is true.
     pub submit_prevented: bool,
+    /// innerHTML mutations: element id → new HTML. Lets the host
+    /// surgically replace those elements in the raw HTML and
+    /// re-render so JS-driven content swaps (e.g. "Loading..." →
+    /// real markup) actually appear in scroll's text view.
+    pub inner_html_changes: HashMap<String, String>,
+    /// Decoded text harvested from any captured Next.js / React
+    /// Flight RSC payload chunks. Treat as plain text content the
+    /// host can append to the rendered page.
+    pub rsc_text: Option<String>,
 }
 
 /// One element's mutable state, addressed by its id attribute. Only
@@ -97,6 +106,10 @@ struct ElementState {
     value: String,
     checked: bool,
     inner_html: String,
+    /// Inner HTML at parse time, so we can diff at the end of the
+    /// run and surface JS-driven `innerHTML = ...` mutations to the
+    /// host without re-running the renderer pipeline twice.
+    original_inner_html: String,
     text_content: String,
     attributes: HashMap<String, String>,
 }
@@ -141,6 +154,13 @@ struct JsState {
     /// to document/window listeners). `submit_prevented` records
     /// whether anything called preventDefault().
     submit_dispatch_target: Option<String>,
+    /// Captured chunks pushed via `self.__next_f.push([1, "<chunk>"])`
+    /// — Next.js / React's streaming RSC payload format. We don't
+    /// run React, but we DO parse the Flight serialisation to pull
+    /// out tag/text structure so JS-rendered Next pages aren't a
+    /// blank "Loading..." in scroll. Joined and parsed at end of
+    /// run via `decode_rsc_payload`.
+    rsc_chunks: Vec<String>,
 }
 
 thread_local! {
@@ -252,11 +272,12 @@ pub fn run_extracted(
         return r;
     }
 
-    for src in scripts {
+    for (i, src) in scripts.iter().enumerate() {
         // Best-effort: a script that throws still lets the next one
         // run, mirroring browser behaviour.
         if let Err(e) = ctx.eval(Source::from_bytes(src.as_bytes())) {
-            record_log("error", &format!("{}", e));
+            let head: String = src.chars().take(60).collect::<String>().replace('\n', " ");
+            record_log("error", &format!("script[{}] ({}): {}", i, head, e));
         }
     }
 
@@ -294,6 +315,18 @@ fn finish_run() -> JsResult {
             .filter(|(_, e)| !e.value.is_empty())
             .map(|(id, e)| (id.clone(), e.value.clone()))
             .collect();
+        // innerHTML diff: any element whose current inner_html
+        // differs from its parse-time original.
+        let inner_html_changes: HashMap<String, String> = st.dom.iter()
+            .filter(|(_, e)| e.inner_html != e.original_inner_html)
+            .map(|(id, e)| (id.clone(), e.inner_html.clone()))
+            .collect();
+        // RSC payload: glue chunks, parse Flight, extract text.
+        let rsc_text = if st.rsc_chunks.is_empty() {
+            None
+        } else {
+            decode_rsc_payload(&st.rsc_chunks.concat())
+        };
         JsResult {
             log: st.log.clone(),
             redirect: st.redirect.clone(),
@@ -305,6 +338,8 @@ fn finish_run() -> JsResult {
             dom_dirty: st.dom_dirty,
             scripts: Vec::new(),  // filled in by run_extracted
             submit_prevented: st.submit_prevented,
+            inner_html_changes,
+            rsc_text,
         }
     })
 }
@@ -375,27 +410,34 @@ fn parse_dom(html: &str) -> HashMap<String, ElementState> {
         let inner_html = el.inner_html();
         let text_content: String = el.text().collect::<Vec<_>>().join("");
         map.insert(id, ElementState {
-            tag, value, checked, inner_html, text_content, attributes: attrs,
+            tag, value, checked,
+            original_inner_html: inner_html.clone(),
+            inner_html,
+            text_content,
+            attributes: attrs,
         });
     }
     map
 }
 
-/// Extract every script source on the page in document order:
-/// inline ones become their literal body; external `<script src=...>`
-/// ones are fetched via a fresh ureq request scoped with the
-/// caller-provided cookies. Bounded so a malicious page can't
-/// spawn unbounded fetches: max 16 scripts, max 1 MB total bytes,
-/// 5-second per-fetch timeout.
-fn extract_scripts_in_order(html: &str, page_url: &str, cookies: &HashMap<String, String>) -> Vec<String> {
-    const MAX_SCRIPTS: usize = 16;
-    const MAX_TOTAL_BYTES: usize = 1_048_576;
+/// Extract every inline `<script>` body in document order. External
+/// `<script src=...>` are intentionally skipped: they're nearly
+/// always framework runtimes (React, Next, Turbopack, webpack)
+/// that need a real DOM and won't run in boa. Skipping them means
+/// the inline scripts that DO matter — the streaming
+/// `__next_f.push([1, "<chunk>"])` lines, simple form-validating
+/// inline scripts — get to run without being crowded out by the
+/// (now-removed) script-count cap.
+///
+/// Total inline-script size capped at 4 MB so a pathological page
+/// can't spike memory.
+fn extract_scripts_in_order(html: &str, _page_url: &str, _cookies: &HashMap<String, String>) -> Vec<String> {
+    const MAX_TOTAL_BYTES: usize = 4 * 1_048_576;
     let mut out = Vec::new();
     let mut total = 0usize;
     let lower = html.to_ascii_lowercase();
     let mut i = 0usize;
     while let Some(start) = lower[i..].find("<script") {
-        if out.len() >= MAX_SCRIPTS { break; }
         let s = i + start;
         let tag_end = match lower[s..].find('>') { Some(e) => s + e, None => break };
         let opening = &html[s..=tag_end];
@@ -407,19 +449,16 @@ fn extract_scripts_in_order(html: &str, page_url: &str, cookies: &HashMap<String
         let close = body_start + close_rel;
         let body = &html[body_start..close];
 
-        // External vs inline.
-        if let Some(src_url) = parse_src_attr(opening) {
-            let resolved = absolute_url(page_url, &src_url);
-            if let Some(content) = fetch_script(&resolved, cookies, MAX_TOTAL_BYTES.saturating_sub(total)) {
-                total += content.len();
-                out.push(content);
-            }
-        } else if !body.trim().is_empty() {
+        // External: skip silently.
+        if parse_src_attr(opening).is_some() {
+            i = close + "</script>".len();
+            continue;
+        }
+        if !body.trim().is_empty() {
             if total + body.len() > MAX_TOTAL_BYTES { break; }
             total += body.len();
             out.push(body.to_string());
         }
-
         i = close + "</script>".len();
     }
     out
@@ -694,6 +733,84 @@ fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
     ctx.register_global_callable(js_string!("clearInterval"), 0,
         NativeFunction::from_copy_closure(|_t, _args, _c| Ok(JsValue::undefined())))?;
 
+    // ---------- URL constructor + matchMedia stubs ----------
+    // Many pages do `new URL(...)` for parsing. boa has no built-in
+    // WHATWG URL; without this they throw before reaching the
+    // __next_f.push lines further down the page. Naive regex parser
+    // is enough for typical use.
+    let _ = ctx.eval(Source::from_bytes(br#"
+        function URL(href, base) {
+            this.href = href || '';
+            var m = /^([a-z][a-z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(this.href);
+            if (m) {
+                this.protocol = m[1] + ':';
+                this.host = m[2];
+                this.hostname = (m[2] || '').split(':')[0];
+                this.pathname = m[3] || '/';
+                this.search = m[4] || '';
+                this.hash = m[5] || '';
+            } else {
+                this.protocol = ''; this.host = ''; this.hostname = '';
+                this.pathname = this.href; this.search = ''; this.hash = '';
+            }
+            this.toString = function() { return this.href; };
+            this.searchParams = {
+                get: function() { return null; },
+                set: function() {}, has: function() { return false; },
+                toString: function() { return ''; }
+            };
+        }
+    "#));
+    // matchMedia: theme detection asks the browser whether the user
+    // prefers dark mode. We always say no, falling the JS into its
+    // default branch.
+    let _ = ctx.eval(Source::from_bytes(br#"
+        var matchMedia = function(q) {
+            return {
+                matches: false, media: q,
+                addListener: function(){}, removeListener: function(){},
+                addEventListener: function(){}, removeEventListener: function(){}
+            };
+        };
+    "#));
+
+    // ---------- Next.js / React Flight streaming-payload capture ----------
+    // Next.js emits its rendered tree as a series of inline scripts:
+    //   self.__next_f = self.__next_f || [];
+    //   self.__next_f.push([1, "<chunk>"]);
+    //
+    // We can't run React (multi-MB bundle, no real DOM), but the
+    // chunks contain Flight-serialised React trees we CAN parse for
+    // text. Pre-register __next_f as an object with a `push` method
+    // that captures every chunk into STATE.rsc_chunks. When the page
+    // does `self.__next_f = self.__next_f || []`, our truthy object
+    // stays in place. self is aliased to globalThis below.
+    let next_f = ObjectInitializer::new(ctx)
+        .function(NativeFunction::from_copy_closure(|_t, args, ctx| {
+            for arg in args {
+                if let JsValue::Object(arr) = arg {
+                    // push receives [tag, "<chunk>"] tuples; the chunk
+                    // is at index 1.
+                    if let Ok(v) = arr.get(1u32, ctx) {
+                        if let Ok(s) = v.to_string(ctx) {
+                            STATE.with(|st|
+                                st.borrow_mut().rsc_chunks.push(s.to_std_string_escaped()));
+                        }
+                    }
+                }
+            }
+            Ok(JsValue::Integer(0))
+        }), js_string!("push"), 1)
+        .build();
+    ctx.register_global_property(js_string!("__next_f"), next_f, Attribute::all())?;
+    // `self` alias to globalThis. Browser-shaped scripts use it
+    // interchangeably with `window` and `globalThis`. Doing it via
+    // a property write on the global object guarantees the binding,
+    // unlike a `var self = globalThis` eval which boa sometimes
+    // resolves into a local TDZ snapshot.
+    let global = ctx.global_object();
+    let _ = global.set(js_string!("self"), JsValue::from(global.clone()), false, ctx);
+
     // ---------- fetch ----------
     // Synchronous-but-pretends-thenable. Real fetch is async; here
     // the network call blocks inside the closure and the returned
@@ -840,6 +957,95 @@ fn do_fetch(ctx: &mut Context, url: &str, opts: Option<JsValue>) -> BoaResult<Js
     // The fetch() return value is itself thenable: .then(cb) calls
     // cb(response) synchronously and rewraps the result.
     make_thenable(ctx, JsValue::from(resp_obj))
+}
+
+/// Parse a glued Next.js / React Flight payload and harvest any
+/// text content the server-side render baked in. Each "line" in the
+/// payload looks like `<id>:<value>` where value is either JSON (the
+/// real tree) or `I[mod, deps, name]` (a Client Component import,
+/// which we can't run). We only care about the JSON entries; we
+/// walk them and pull out string leaves under the right keys.
+///
+/// This is best-effort: pages whose entire visible content is
+/// produced by Client Components (which run in the browser, not on
+/// the server) will yield little. Pages with Server Components or
+/// statically rendered text yield real content.
+pub fn decode_rsc_payload(payload: &str) -> Option<String> {
+    let mut entries: HashMap<String, serde_json::Value> = HashMap::new();
+    for line in payload.split('\n') {
+        let (id, body) = match line.split_once(':') {
+            Some(p) => p, None => continue,
+        };
+        if body.starts_with('I') || body.starts_with('H') { continue; }  // imports / hyperlinks
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+            entries.insert(id.to_string(), v);
+        }
+    }
+    if entries.is_empty() { return None; }
+
+    let mut out = String::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Walk every JSON entry — passionfruits-style payloads stream the
+    // root tree across multiple top-level entries, not just "0".
+    let mut keys: Vec<String> = entries.keys().cloned().collect();
+    keys.sort();  // deterministic output
+    for k in keys {
+        if let Some(v) = entries.get(&k) {
+            extract_rsc_text(v, &mut out, &mut seen);
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+fn extract_rsc_text(v: &serde_json::Value, out: &mut String, seen: &mut std::collections::HashSet<String>) {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            // Skip Flight reference markers ($S = symbol, $L = client
+            // component import, $undefined etc.) and very short strings
+            // that are usually attribute values not body text.
+            if s.starts_with('$') { return; }
+            let t = s.trim();
+            if t.is_empty() { return; }
+            // Skip strings that look like CSS class blobs / hashes.
+            if t.contains("__") && !t.contains(' ') { return; }
+            if seen.insert(t.to_string()) {
+                out.push_str(t);
+                out.push('\n');
+            }
+        }
+        Value::Array(arr) => {
+            // React Flight element form: ["$", tag, key, props].
+            // The fourth element is the props object, which carries
+            // children. Recurse into props directly to skip the tag.
+            if arr.len() >= 4 {
+                if let Some(Value::String(s)) = arr.first() {
+                    if s == "$" {
+                        extract_rsc_text(&arr[3], out, seen);
+                        return;
+                    }
+                }
+            }
+            for item in arr { extract_rsc_text(item, out, seen); }
+        }
+        Value::Object(obj) => {
+            // Visible-text-bearing keys. "children" is the big one.
+            // "title" / "alt" / "label" / "placeholder" cover ARIA-ish
+            // surfaces. Skip everything else (className, style, refs,
+            // event handlers, …).
+            const CONTENT_KEYS: &[&str] = &[
+                "children", "title", "alt", "label", "placeholder",
+                "description", "value", "text", "content",
+            ];
+            for k in CONTENT_KEYS {
+                if let Some(child) = obj.get(*k) {
+                    extract_rsc_text(child, out, seen);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn read_body(this: &JsValue, ctx: &mut Context) -> String {
@@ -1275,6 +1481,35 @@ mod dom_fetch_tests {
     }
 
     #[test]
+    fn innerhtml_change_is_surfaced() {
+        let html = r#"<html><body>
+            <div id="app">Loading...</div>
+            <script>
+              document.getElementById("app").innerHTML = "<h1>Hello</h1><p>World</p>";
+            </script>
+        </body></html>"#;
+        let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
+        let app = r.inner_html_changes.get("app").map(String::as_str).unwrap_or("");
+        assert!(app.contains("<h1>Hello</h1>"), "got: {:?}", app);
+    }
+
+    #[test]
+    fn rsc_payload_extracts_text() {
+        // Synthetic Next.js-style payload pushed via __next_f.push.
+        let html = r#"<html><body>
+            <div id="root">Loading...</div>
+            <script>
+              self.__next_f = self.__next_f || [];
+              self.__next_f.push([1, '0:["$","main",null,{"children":[["$","h1",null,{"children":"Welcome"}],["$","p",null,{"children":"Hello world"}]]}]\n']);
+            </script>
+        </body></html>"#;
+        let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
+        let rsc = r.rsc_text.as_deref().unwrap_or("");
+        assert!(rsc.contains("Welcome"), "rsc: {:?}", rsc);
+        assert!(rsc.contains("Hello world"), "rsc: {:?}", rsc);
+    }
+
+    #[test]
     fn submit_dispatch_no_listener_is_noop() {
         let html = r#"<html><body><form id="login"></form>
             <script>console.log("no listener");</script>
@@ -1305,5 +1540,37 @@ mod dom_fetch_tests {
         let r = run_scripts(html, "https://example.com/", Default::default(), Default::default());
         // The chain should run regardless of network outcome.
         assert!(r.log.iter().any(|l| l.contains("chain: first-then")), "log: {:?}", r.log);
+    }
+}
+
+#[cfg(test)]
+mod live_passionfruits {
+    use super::*;
+    /// Hits passionfruits.net live and reports what the RSC parser
+    /// can pull out. Marked `ignore` so CI doesn't depend on the
+    /// network. Run with: `cargo test --release passionfruits -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn dump_extracted_text() {
+        let html = match ureq::get("https://passionfruits.net/")
+            .set("User-Agent", "Mozilla/5.0 scroll-test")
+            .call()
+        {
+            Ok(r) => r.into_string().unwrap_or_default(),
+            Err(e) => { eprintln!("network fail: {}", e); return; }
+        };
+        let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
+        eprintln!("--- inner_html_changes ({}) ---", r.inner_html_changes.len());
+        for (k, v) in &r.inner_html_changes {
+            eprintln!("  {} (len {}): {}", k, v.len(),
+                if v.len() > 80 { &v[..80] } else { v });
+        }
+        eprintln!("--- rsc_text ---");
+        match &r.rsc_text {
+            Some(t) => eprintln!("{}", t),
+            None => eprintln!("(none)"),
+        }
+        eprintln!("--- log ({}) ---", r.log.len());
+        for line in r.log.iter().take(20) { eprintln!("  {}", line); }
     }
 }
