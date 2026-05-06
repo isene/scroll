@@ -1546,6 +1546,49 @@ mod dom_fetch_tests {
 #[cfg(test)]
 mod live_passionfruits {
     use super::*;
+    /// Full pipeline trace: fetch → js → injected HTML → renderer.
+    /// Prints what the user actually sees. Run with:
+    ///   cargo test --release passionfruits_full -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn passionfruits_full_pipeline() {
+        let html = match ureq::get("https://passionfruits.net/")
+            .set("User-Agent", "Mozilla/5.0 scroll-test")
+            .call()
+        {
+            Ok(r) => r.into_string().unwrap_or_default(),
+            Err(e) => { eprintln!("network fail: {}", e); return; }
+        };
+        let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
+        eprintln!("redirect = {:?}", r.redirect);
+        eprintln!("inner_html_changes = {} entries", r.inner_html_changes.len());
+        eprintln!("--- rsc_text -----------------------------");
+        match &r.rsc_text {
+            Some(t) => eprintln!("{}", t),
+            None => eprintln!("(none)"),
+        }
+        eprintln!("------------------------------------------");
+        // Mirror what main.rs does: inject the rsc_text below </body>.
+        let mut effective = html.clone();
+        if let Some(rsc) = &r.rsc_text {
+            let safe = rsc.replace('<', "&lt;").replace('>', "&gt;");
+            let block = format!("<hr><div><pre>{}</pre></div>", safe);
+            if let Some(idx) = effective.to_ascii_lowercase().rfind("</body>") {
+                effective.insert_str(idx, &block);
+            } else {
+                effective.push_str(&block);
+            }
+        }
+        let rendered = crate::renderer::render_html(&effective, 120, "https://passionfruits.net/", &crate::config::Config::default());
+        eprintln!("--- rendered text (stripped) -------------");
+        let stripped = crust::strip_ansi(&rendered.text);
+        for (i, line) in stripped.lines().enumerate() {
+            eprintln!("{:3} {}", i, line);
+            if i > 80 { eprintln!("..."); break; }
+        }
+        eprintln!("------------------------------------------");
+    }
+
     /// Hits passionfruits.net live and reports what the RSC parser
     /// can pull out. Marked `ignore` so CI doesn't depend on the
     /// network. Run with: `cargo test --release passionfruits -- --ignored --nocapture`

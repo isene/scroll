@@ -80,6 +80,16 @@ struct App {
 }
 
 fn main() {
+    // Refuse to run without a real TTY. crossterm's event::poll on a
+    // non-tty can return Err immediately, which our main loop turns
+    // into a tight None-then-continue spin at 100% CPU. Detect at
+    // startup and exit cleanly. Fixes battery-eating runaways from
+    // accidental backgrounding (e.g. `scroll --version &`).
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("scroll: refusing to run without a TTY on stdin (would spin at 100% CPU). Run interactively.");
+        std::process::exit(2);
+    }
     config::ensure_dirs();
 
     let initial_url = std::env::args().nth(1).unwrap_or_else(|| "about:home".into());
