@@ -95,6 +95,19 @@ pub struct Config {
     /// hues so 1–3 sets are visually unambiguous out of the box.
     #[serde(default = "default_set_colors")]
     pub set_colors: Vec<u16>,
+    /// Map a set name to a Firefox profile name (or absolute profile
+    /// directory path). On set switch, scroll imports that profile's
+    /// `cookies.sqlite` into the active cookie jar so the user can
+    /// be logged in to a site (Google, etc.) as different identities
+    /// in different sets without scroll having a JS engine. Log in
+    /// once via Firefox per profile; scroll inherits the cookies.
+    /// Empty / missing entry = no import; jar stays scroll-managed.
+    /// Examples:
+    ///   "Personal"      → "default"
+    ///   "Dualog"        → "scroll-dualog"
+    ///   "PassionFruits" → "/home/geir/.mozilla/firefox/abc.passionfruits"
+    #[serde(default)]
+    pub firefox_profiles: HashMap<String, String>,
 }
 
 fn default_homepage() -> String { "about:home".into() }

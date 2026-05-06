@@ -137,6 +137,14 @@ fn main() {
 
     app.main.scroll = true;
 
+    // First-run FF cookie import for the initial set (set_active_set
+    // wasn't called via activate_set on construction).
+    if let Some(profile) = app.conf.firefox_profiles.get(&initial_set).cloned() {
+        if !profile.is_empty() {
+            let _ = app.fetcher.import_firefox_cookies(&profile);
+        }
+    }
+
     // Create initial tab in the current set and navigate.
     app.tabs.push(Tab::new("about:blank"));
     app.tab_set.push(app.current_set);
@@ -802,8 +810,18 @@ impl App {
     /// undo-close, etc.) route through this so we can't forget one.
     fn activate_set(&mut self, new_set: usize) {
         self.current_set = new_set;
-        if let Some(name) = self.sets.get(new_set) {
-            self.fetcher.set_active_set(name);
+        if let Some(name) = self.sets.get(new_set).cloned() {
+            self.fetcher.set_active_set(&name);
+            // If this set is mapped to a Firefox profile, refresh
+            // the jar from that profile's cookies.sqlite. Lets the
+            // user log in to Google (or anywhere JS-heavy) once in
+            // Firefox per profile and have scroll inherit the
+            // session per set, with no JS engine in scroll itself.
+            if let Some(profile) = self.conf.firefox_profiles.get(&name).cloned() {
+                if !profile.is_empty() {
+                    let _ = self.fetcher.import_firefox_cookies(&profile);
+                }
+            }
         }
     }
 
@@ -1545,6 +1563,7 @@ impl App {
             "   :back / :forward / :reload / :help".into(),
             "   :password          save credentials for current site".into(),
             "   :adblock           update ad-block list".into(),
+            "   :ffimport          re-import cookies from current set's FF profile".into(),
             String::new(),
             style::fg(" j/k or ↓/↑ scroll · ESC / q / ? close", 245),
         ];
@@ -1700,7 +1719,33 @@ impl App {
             }
             "password" | "pw" => { self.save_password_cmd(); }
             "adblock" => { self.update_adblock(); }
+            "ffimport" => { self.ffimport_cmd(); }
             _ => { self.status.say(&style::fg(&format!(" Unknown command: {}", command), 196)); }
+        }
+    }
+
+    /// `:ffimport` — refresh the active jar from the configured
+    /// Firefox profile right now, without waiting for the next set
+    /// switch. Useful after logging in to a site in Firefox.
+    fn ffimport_cmd(&mut self) {
+        let set_name = self.sets.get(self.current_set).cloned().unwrap_or_default();
+        let profile = match self.conf.firefox_profiles.get(&set_name).cloned() {
+            Some(p) if !p.is_empty() => p,
+            _ => {
+                self.status.say(&style::fg(
+                    &format!(" No firefox_profiles entry for set \"{}\" — set one in ~/.scroll/config.json",
+                        set_name),
+                    220,
+                ));
+                return;
+            }
+        };
+        match self.fetcher.import_firefox_cookies(&profile) {
+            Some(n) => self.status.say(&format!(" Imported {} cookies from FF profile \"{}\"", n, profile)),
+            None => self.status.say(&style::fg(
+                &format!(" FF import failed: profile \"{}\" not found or db locked", profile),
+                196,
+            )),
         }
     }
 

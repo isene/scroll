@@ -90,6 +90,90 @@ impl Fetcher {
         }
     }
 
+    /// Import cookies from a Firefox profile into the currently
+    /// active jar. `profile` may be a bare profile name (resolved
+    /// against `~/.mozilla/firefox/profiles.ini`) or an absolute
+    /// profile directory. Returns the number of cookies imported,
+    /// or `None` on any failure (missing profile, locked db, etc.).
+    /// Best-effort: if Firefox is running with an exclusive lock on
+    /// `cookies.sqlite`, the import silently no-ops so scroll keeps
+    /// working with whatever it imported last.
+    pub fn import_firefox_cookies(&mut self, profile: &str) -> Option<usize> {
+        let dir = Self::resolve_firefox_profile(profile)?;
+        let db = dir.join("cookies.sqlite");
+        if !db.exists() { return None; }
+        // Open read-only with immutable=1 so we don't fight Firefox
+        // for the WAL lock. Connection-string flags via SQLite URI.
+        let uri = format!("file:{}?mode=ro&immutable=1", db.display());
+        let conn = rusqlite::Connection::open_with_flags(
+            &uri,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ).ok()?;
+        let mut stmt = conn.prepare("SELECT host, name, value FROM moz_cookies").ok()?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }).ok()?;
+        let active = self.active_set.clone();
+        let jar = self.jars.entry(active).or_default();
+        let mut count = 0;
+        for row in rows.flatten() {
+            let (mut host, name, value) = row;
+            // Firefox stores subdomain-shareable cookies with a leading
+            // dot (".google.com"). Our subdomain walk in fetch() ascends
+            // from full host upward, so we want the bare form.
+            if host.starts_with('.') { host = host[1..].to_string(); }
+            jar.entry(host).or_default().insert(name, value);
+            count += 1;
+        }
+        self.save_active_jar();
+        Some(count)
+    }
+
+    fn resolve_firefox_profile(profile: &str) -> Option<std::path::PathBuf> {
+        // Absolute path — use it directly.
+        let p = std::path::Path::new(profile);
+        if p.is_absolute() && p.is_dir() {
+            return Some(p.to_path_buf());
+        }
+        // Otherwise treat `profile` as a profile NAME and look it up
+        // in profiles.ini, like Firefox itself does.
+        let home = std::env::var("HOME").ok()?;
+        let ff_root = std::path::PathBuf::from(&home).join(".mozilla/firefox");
+        let ini_path = ff_root.join("profiles.ini");
+        let ini = fs::read_to_string(&ini_path).ok()?;
+        let mut current_name: Option<String> = None;
+        let mut current_path: Option<String> = None;
+        let mut current_relative = true;
+        let mut found: Option<(String, bool)> = None;
+        for line in ini.lines() {
+            let line = line.trim();
+            if line.starts_with('[') {
+                if let (Some(n), Some(pa)) = (current_name.take(), current_path.take()) {
+                    if n == profile {
+                        found = Some((pa, current_relative));
+                        break;
+                    }
+                }
+                current_relative = true;
+                continue;
+            }
+            if let Some(v) = line.strip_prefix("Name=") { current_name = Some(v.to_string()); }
+            else if let Some(v) = line.strip_prefix("Path=") { current_path = Some(v.to_string()); }
+            else if line == "IsRelative=0" { current_relative = false; }
+        }
+        // Tail section (no closing [Profile…] after it)
+        if found.is_none() {
+            if let (Some(n), Some(pa)) = (current_name, current_path) {
+                if n == profile { found = Some((pa, current_relative)); }
+            }
+        }
+        let (path, relative) = found?;
+        let resolved = if relative { ff_root.join(path) } else { std::path::PathBuf::from(path) };
+        if resolved.is_dir() { Some(resolved) } else { None }
+    }
+
     fn save_active_jar(&self) {
         if let Some(jar) = self.jars.get(&self.active_set) {
             if let Ok(json) = serde_json::to_string_pretty(jar) {
@@ -150,18 +234,44 @@ impl Fetcher {
             .set("Accept", "text/html,application/xhtml+xml,*/*")
             .set("Accept-Language", "en-US,en;q=0.9");
 
-        // Add cookies from the active set's jar.
+        // Add cookies from the active set's jar. Walk the subdomain
+        // chain (accounts.google.com → google.com → com) so a cookie
+        // stored against `google.com` matches a request to
+        // `accounts.google.com`. This is required for Firefox-imported
+        // cookies, which use bare domain (leading-dot stripped on
+        // import).
         if let Ok(parsed) = url::Url::parse(&fetch_url) {
-            if let Some(domain) = parsed.host_str() {
+            if let Some(host) = parsed.host_str() {
                 if let Some(jar) = self.jars.get(&self.active_set) {
-                    if let Some(domain_cookies) = jar.get(domain) {
-                        let cookie_str: String = domain_cookies.iter()
+                    let mut combined: HashMap<String, String> = HashMap::new();
+                    let mut current: &str = host;
+                    loop {
+                        if let Some(domain_cookies) = jar.get(current) {
+                            for (k, v) in domain_cookies {
+                                combined.entry(k.clone()).or_insert_with(|| v.clone());
+                            }
+                        }
+                        match current.find('.') {
+                            Some(dot) => current = &current[dot + 1..],
+                            None => break,
+                        }
+                        if current.is_empty() || !current.contains('.') {
+                            // Stop before TLD-only ("com", "co.uk" → won't get there
+                            // because we break when no dot remains).
+                            if let Some(domain_cookies) = jar.get(current) {
+                                for (k, v) in domain_cookies {
+                                    combined.entry(k.clone()).or_insert_with(|| v.clone());
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    if !combined.is_empty() {
+                        let cookie_str: String = combined.iter()
                             .map(|(k, v)| format!("{}={}", k, v))
                             .collect::<Vec<_>>()
                             .join("; ");
-                        if !cookie_str.is_empty() {
-                            req = req.set("Cookie", &cookie_str);
-                        }
+                        req = req.set("Cookie", &cookie_str);
                     }
                 }
             }
