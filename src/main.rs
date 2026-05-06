@@ -85,6 +85,10 @@ fn main() {
 
     Crust::init();
     Crust::set_app_identity("Scroll");
+    // Ask the terminal for distinct sequences for modified keys so
+    // we can tell Shift+Backspace from plain Backspace (kitty kbd
+    // protocol). Best-effort.
+    Crust::enable_modifier_keys();
     let (cols, rows) = Crust::terminal_size();
 
     let conf = Config::load();
@@ -194,7 +198,7 @@ fn main() {
             "t" => { app.open_in_new_tab(); }
             "T" => { app.tabopen_focused(); }
             "H" | "BACK" => { app.go_back(); }
-            "L" | "DEL" => { app.go_forward(); }
+            "L" | "DEL" | "S-BACK" => { app.go_forward(); }
             "r" => { app.reload(); }
 
             // Links & forms
@@ -1309,14 +1313,19 @@ impl App {
 
     // --- Clipboard ---
 
-    fn copy_url(&self) {
-        crust::clipboard_copy(&self.tab().url, "clipboard");
+    fn copy_url(&mut self) {
+        let url = self.tab().url.clone();
+        crust::clipboard_copy(&url, "clipboard");
+        self.status.say(&format!(" Copied: {}", url));
     }
 
-    fn copy_focused_url(&self) {
-        if self.focus_index >= 0 && (self.focus_index as usize) < self.tab().links.len() {
-            crust::clipboard_copy(&self.tab().links[self.focus_index as usize].href, "clipboard");
-        }
+    fn copy_focused_url(&mut self) {
+        if self.focus_index < 0 { return; }
+        let idx = self.focus_index as usize;
+        if idx >= self.tab().links.len() { return; }
+        let href = self.tab().links[idx].href.clone();
+        crust::clipboard_copy(&href, "clipboard");
+        self.status.say(&format!(" Copied: {}", href));
     }
 
     // --- Images ---
