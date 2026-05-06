@@ -13,10 +13,26 @@ pub fn bookmarks_path() -> PathBuf { scroll_dir().join("bookmarks.json") }
 pub fn quickmarks_path() -> PathBuf { scroll_dir().join("quickmarks.json") }
 pub fn passwords_path() -> PathBuf { scroll_dir().join("passwords.json") }
 pub fn cookies_path() -> PathBuf { scroll_dir().join("cookies.json") }
+pub fn cookies_dir() -> PathBuf { scroll_dir().join("cookies") }
 pub fn adblock_path() -> PathBuf { scroll_dir().join("adblock.txt") }
+
+/// Per-set cookie-jar file path. Sanitises the set name so a stray
+/// `/` or `..` can't escape the cookies dir.
+pub fn cookie_jar_path(set_name: &str) -> PathBuf {
+    let safe: String = set_name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    let safe = if safe.is_empty() || safe.starts_with('.') {
+        format!("_{}", safe)
+    } else {
+        safe
+    };
+    cookies_dir().join(format!("{}.json", safe))
+}
 
 pub fn ensure_dirs() {
     let _ = fs::create_dir_all(scroll_dir());
+    let _ = fs::create_dir_all(cookies_dir());
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -65,6 +81,20 @@ pub struct Config {
     // AI
     #[serde(default)]
     pub ai_key: String,
+    /// Optional external password command. Called as `<cmd> <host>`;
+    /// must print exactly two lines on stdout: `username\npassword\n`.
+    /// Empty string = disabled (use built-in `passwords.json` only).
+    /// Example wrapper for the user's HyperList password file:
+    ///   `~/bin/scroll-pass` reads `/home/.safe/.p.hl`, looks up
+    ///   `$1`, emits `user\npass`.
+    #[serde(default)]
+    pub password_command: String,
+    /// Per-set foreground colors (256-color codes). Indexed by set
+    /// position; if a set's index is past the end of this list, it
+    /// falls back to `c_active_tab`. Default cycle is six distinct
+    /// hues so 1–3 sets are visually unambiguous out of the box.
+    #[serde(default = "default_set_colors")]
+    pub set_colors: Vec<u16>,
 }
 
 fn default_homepage() -> String { "about:home".into() }
@@ -88,6 +118,15 @@ fn default_link_num() -> u16 { 39 }
 fn default_h1() -> u16 { 220 }
 fn default_h2() -> u16 { 214 }
 fn default_h3() -> u16 { 208 }
+fn default_set_colors() -> Vec<u16> {
+    // Match the user's rsh dir_colors palette so set identity is
+    // consistent across shell + browser:
+    //   Personal       = 172 (orange,  MakeItSimple in ~/.rshrc)
+    //   PassionFruits  = 171 (magenta, PassionFruit in ~/.rshrc)
+    //   Dualog         =  72 (teal,    Dualog in ~/.rshrc)
+    // Trailing entries are extras for any user-added sets.
+    vec![172, 171, 72, 220, 121, 217]
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -157,5 +196,26 @@ pub fn save_passwords(pw: &HashMap<String, (String, String)>) {
             use std::os::unix::fs::PermissionsExt;
             let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
         }
+    }
+}
+
+fn sets_path() -> PathBuf {
+    scroll_dir().join("sets.json")
+}
+
+/// Load named tab sets. Defaults to ["Personal", "PassionFruits",
+/// "Dualog"] on first run; the rcfile can be edited freely.
+pub fn load_sets() -> Vec<String> {
+    if let Ok(s) = fs::read_to_string(sets_path()) {
+        if let Ok(v) = serde_json::from_str::<Vec<String>>(&s) {
+            if !v.is_empty() { return v; }
+        }
+    }
+    vec!["Personal".into(), "PassionFruits".into(), "Dualog".into()]
+}
+
+pub fn save_sets(sets: &[String]) {
+    if let Ok(json) = serde_json::to_string_pretty(sets) {
+        let _ = fs::write(sets_path(), json);
     }
 }

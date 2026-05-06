@@ -18,6 +18,22 @@ struct ImgDownloadState {
     ready: Vec<String>,              // cache paths that finished downloading
 }
 
+/// One planned image placement. `full_w/full_h` is the image's stable
+/// natural rendered size in cells (sent to glow as the cache key
+/// stabilizer); `src_top/src_visible` is the cell-row crop window
+/// into that source — varies as the image scrolls past viewport edges
+/// without invalidating glow's image_cache.
+#[derive(Clone, PartialEq)]
+struct ImagePlanEntry {
+    path: String,
+    x: u16,
+    y: u16,
+    full_w: u16,
+    full_h: u16,
+    src_top: u16,
+    src_visible: u16,
+}
+
 struct App {
     info: Pane,
     tab_bar: Pane,
@@ -29,7 +45,17 @@ struct App {
     fetcher: Fetcher,
     tabs: Vec<Tab>,
     current_tab: usize,
+    /// Per-tab set membership — tab N is a member of set `tab_set[N]`.
+    /// Default 3 sets: 0 = Personal, 1 = PassionFruits, 2 = Dualog.
+    /// Index into `sets` (the names list).
+    tab_set: Vec<usize>,
+    /// Named sets. Persisted to `~/.scroll/sets.json`.
+    sets: Vec<String>,
+    /// Active set index — Right/Left tab cycle skips tabs not in this
+    /// set; new tabs inherit this set.
+    current_set: usize,
     closed_tabs: Vec<Tab>,
+    closed_tab_sets: Vec<usize>,
     focus_index: i32,
     search_term: String,
     search_matches: Vec<usize>,
@@ -43,6 +69,12 @@ struct App {
     image_display: Option<glow::Display>,
     img_state: Arc<Mutex<ImgDownloadState>>,
     img_thread: Option<std::thread::JoinHandle<()>>,
+    /// Track `(image_src, viewport_top, line, x, y, w, h)` for every
+    /// image scroll has currently placed. Re-render skips re-transmission
+    /// when the visible set + their geometry haven't changed — this
+    /// cuts kitty image churn during pure-text scrolling, which was
+    /// burning through glass's IMG_SLOTS (32) within a session.
+    last_placed: Vec<ImagePlanEntry>,
     adblock_domains: HashSet<String>,
 }
 
@@ -60,18 +92,26 @@ fn main() {
     let img_mode = conf.image_mode.clone();
     let main_h = rows.saturating_sub(3);
 
+    let sets = config::load_sets();
+    let initial_set = sets.first().cloned().unwrap_or_else(|| "Personal".into());
+    let mut status_pane = Pane::new(1, rows, cols, 1, conf.c_status_fg, conf.c_status_bg);
+    status_pane.record = true;  // shared history across all prompts (Up/Down recalls)
     let mut app = App {
         info: Pane::new(1, 1, cols, 1, conf.c_info_fg, conf.c_info_bg),
         tab_bar: Pane::new(1, 2, cols, 1, conf.c_tab_fg, conf.c_tab_bg),
         main: Pane::new(1, 3, cols, main_h, conf.c_content_fg, conf.c_content_bg),
-        status: Pane::new(1, rows, cols, 1, conf.c_status_fg, conf.c_status_bg),
+        status: status_pane,
         cols,
         rows,
         conf,
-        fetcher: Fetcher::new(),
+        fetcher: Fetcher::new_with_set(&initial_set),
         tabs: Vec::new(),
         current_tab: 0,
+        tab_set: Vec::new(),
+        sets,
+        current_set: 0,
         closed_tabs: Vec::new(),
+        closed_tab_sets: Vec::new(),
         focus_index: -1,
         search_term: String::new(),
         search_matches: Vec::new(),
@@ -87,13 +127,15 @@ fn main() {
         } else { None },
         img_state: Arc::new(Mutex::new(ImgDownloadState { pending: Vec::new(), ready: Vec::new() })),
         img_thread: None,
+        last_placed: Vec::new(),
         adblock_domains: load_adblock(),
     };
 
     app.main.scroll = true;
 
-    // Create initial tab and navigate
+    // Create initial tab in the current set and navigate.
     app.tabs.push(Tab::new("about:blank"));
+    app.tab_set.push(app.current_set);
     app.navigate(&initial_url);
     app.render_all();
 
@@ -110,12 +152,16 @@ fn main() {
 
         if app.g_pressed {
             app.g_pressed = false;
-            if key == "g" {
-                app.main.ix = 0;
-                app.render_main();
-                continue;
+            match key.as_str() {
+                "g" => { app.main.ix = 0; app.render_main(); continue; }
+                // Tab-set admin under `g`. The cycling is on arrow keys.
+                "n" => { app.rename_set(); continue; }
+                "N" => { app.new_set(); continue; }
+                "m" => { app.move_tab_to_set(); continue; }
+                _ => {}
             }
         }
+
 
         match key.as_str() {
             // Scrolling
@@ -133,14 +179,20 @@ fn main() {
 
             // Tab management
             "J" | "RIGHT" => { app.next_tab(); }
-            "K" | "LEFT" => { app.prev_tab(); }
+            "K" | "LEFT"  => { app.prev_tab(); }
+            "S-RIGHT" => { app.move_tab_right(); }
+            "S-LEFT"  => { app.move_tab_left(); }
+            "C-RIGHT" => { app.next_set(); }
+            "C-LEFT"  => { app.prev_set(); }
             "d" => { app.close_tab(); }
+            "D" => { app.delete_current_set(); }
             "u" => { app.undo_close_tab(); }
 
             // Navigation
             "o" => { app.open_url_prompt(); }
             "O" => { app.edit_url_prompt(); }
             "t" => { app.open_in_new_tab(); }
+            "T" => { app.tabopen_focused(); }
             "H" | "BACK" => { app.go_back(); }
             "L" | "DEL" => { app.go_forward(); }
             "r" => { app.reload(); }
@@ -219,24 +271,58 @@ impl App {
         self.info.say(&format!(" {}{}{}", back, title, fwd));
     }
 
+    /// Color for set at index `i`. Cycles through `conf.set_colors`;
+    /// falls back to `c_active_tab` if the list is empty.
+    fn set_color(&self, i: usize) -> u8 {
+        if self.conf.set_colors.is_empty() {
+            self.conf.c_active_tab as u8
+        } else {
+            self.conf.set_colors[i % self.conf.set_colors.len()] as u8
+        }
+    }
+
     fn render_tabs(&mut self) {
-        if self.tabs.len() <= 1 {
-            self.tab_bar.say("");
+        // Show every set as a small chip, current set highlighted (bold
+        // + brackets), other sets dim. Each set carries its own color
+        // so identities (per-set cookie jars) are visually distinct.
+        // Replaces the old "[Foo: 1 (+N elsewhere)]" wording, which
+        // forced the user to mentally subtract.
+        let in_set = self.tabs_in_current_set();
+        let count_in_set = in_set.len();
+        let mut chips: Vec<String> = Vec::new();
+        for (i, name) in self.sets.iter().enumerate() {
+            let count = self.tab_set.iter().filter(|&&s| s == i).count();
+            let color = self.set_color(i);
+            let label = format!("{}: {}", name, count);
+            let chip = if i == self.current_set {
+                style::bold(&style::fg(&format!(" [{}] ", label), color))
+            } else {
+                style::fg(&format!(" {} ", label), color)
+            };
+            chips.push(chip);
+        }
+        let chip_block = chips.join("");
+        if count_in_set <= 1 {
+            self.tab_bar.say(&chip_block);
             return;
         }
-        let parts: Vec<String> = self.tabs.iter().enumerate().map(|(i, t)| {
+        let parts: Vec<String> = in_set.iter().map(|&i| {
+            let t = &self.tabs[i];
             let label = if t.title.is_empty() {
                 t.url.chars().take(20).collect::<String>()
             } else {
                 t.title.chars().take(20).collect::<String>()
             };
             if i == self.current_tab {
-                style::fg(&format!(" {} ", label), self.conf.c_active_tab as u8)
+                // Active tab: bold white — pops against the colored
+                // set chips and any inactive tabs.
+                style::bold(&style::fg(&format!(" {} ", label), 255))
             } else {
-                format!(" {} ", label)
+                // Inactive tabs: dim gray.
+                style::fg(&format!(" {} ", label), 244)
             }
         }).collect();
-        self.tab_bar.say(&parts.join("\u{2502}"));
+        self.tab_bar.say(&format!("{}  {}", chip_block, parts.join("\u{2502}")));
     }
 
     fn render_main(&mut self) {
@@ -258,10 +344,11 @@ impl App {
 
         self.main.set_text(&tab.content);
         self.main.ix = tab.ix;
-        // full_refresh redraws the text cells but kitty graphics are an
-        // overlay — we have to delete the old placements explicitly or
-        // they linger behind the new content.
-        if self.conf.show_images { self.clear_images(); }
+        // Diff-based image management: `show_visible_images` decides
+        // whether to clear+re-emit based on plan change. Don't pre-
+        // clear here — that would force re-emission on every render
+        // and burn glass's IMG_SLOTS table within a single browse
+        // session.
         self.main.full_refresh();
         if self.conf.show_images { self.show_visible_images(); }
     }
@@ -333,40 +420,89 @@ impl App {
         }));
     }
 
-    /// Show images that are in viewport AND already cached locally
-    fn show_visible_images(&mut self) {
-        let Some(ref mut display) = self.image_display else { return };
-        if !display.supported() { return; }
-
+    /// Compute the placement plan for the current viewport without
+    /// touching the terminal. Pure function over `tab.images` + scroll
+    /// position + pane geometry. Used by `show_visible_images` for
+    /// the diff check. Plan tuples now carry the FULL natural image
+    /// dims `(img_w, img_h)` plus `(src_top, src_visible)` clip cells —
+    /// this keeps the size stable across scroll lines so glow's cache
+    /// hits and the same kitty image_id (and IMG_SLOT) gets reused.
+    fn compute_image_plan(&self) -> Vec<ImagePlanEntry> {
         let viewport_top = self.tabs[self.current_tab].ix;
         let viewport_h = self.main.h as usize;
         let viewport_bottom = viewport_top + viewport_h;
-        let images = self.tabs[self.current_tab].images.clone();
-
-        for img in &images {
-            // Skip images fully outside viewport
-            if img.line + img.height <= viewport_top || img.line >= viewport_bottom {
-                continue;
-            }
-
+        let mut plan = Vec::new();
+        for img in &self.tabs[self.current_tab].images {
+            if img.line + img.height <= viewport_top || img.line >= viewport_bottom { continue; }
             let cache_path = img_cache_path(&img.src);
-            if std::path::Path::new(&cache_path).exists() {
-                let img_w = (self.main.w / 3).max(30).min(80);
-                if img.line < viewport_top {
-                    // Partially scrolled off top: shrink (kitty uses r= so no re-conversion)
-                    let visible_rows = (img.line + img.height - viewport_top) as u16;
-                    if visible_rows > 0 {
-                        display.show(&cache_path, self.main.x, self.main.y, img_w, visible_rows);
-                    }
-                } else {
-                    // Normal display, clipped to bottom of pane
-                    let y_offset = (img.line - viewport_top) as u16;
-                    let display_y = self.main.y + y_offset;
-                    let display_h = (img.height as u16).min(self.main.h.saturating_sub(y_offset));
-                    display.show(&cache_path, self.main.x, display_y, img_w, display_h);
-                }
+            if !std::path::Path::new(&cache_path).exists() { continue; }
+            let img_w = (self.main.w / 3).max(30).min(80);
+            let img_h = img.height as u16;
+            let (display_x, display_y, src_top, src_visible);
+            if img.line < viewport_top {
+                let clipped_top = (viewport_top - img.line) as u16;
+                let visible_rows = img_h.saturating_sub(clipped_top);
+                if visible_rows == 0 { continue; }
+                display_x = self.main.x;
+                display_y = self.main.y;
+                src_top = clipped_top;
+                src_visible = visible_rows.min(self.main.h);
+            } else {
+                let y_offset = (img.line - viewport_top) as u16;
+                display_x = self.main.x;
+                display_y = self.main.y + y_offset;
+                src_top = 0;
+                src_visible = img_h.min(self.main.h.saturating_sub(y_offset));
+            }
+            if src_visible == 0 { continue; }
+            plan.push(ImagePlanEntry {
+                path: cache_path,
+                x: display_x,
+                y: display_y,
+                full_w: img_w,
+                full_h: img_h,
+                src_top,
+                src_visible,
+            });
+        }
+        plan
+    }
+
+    /// Show images that are in viewport AND already cached locally.
+    /// Diff-based: skips re-transmission when the visible set + their
+    /// geometry haven't changed since the last call. When the plan
+    /// changes, clears the previous placements first and re-emits.
+    /// This caps glass's IMG_SLOTS churn during pure-text scrolling.
+    fn show_visible_images(&mut self) {
+        if self.image_display.is_none() { return; }
+        let supported = self.image_display.as_ref().map(|d| d.supported()).unwrap_or(false);
+        if !supported { return; }
+        let plan = self.compute_image_plan();
+        if plan == self.last_placed {
+            return;
+        }
+        // Plan changed. Per-image diff: only forget paths that
+        // disappeared. For paths still in plan, call show_clipped:
+        // glow keys its cache by full_w/full_h (stable across
+        // viewport-edge clipping) so the same image_id is reused
+        // every scroll line — kitty's source-rect crop handles the
+        // visible portion. Net: no PNG re-transmits and no fresh
+        // IMG_SLOTS burned during pure scrolling.
+        let new_paths: std::collections::HashSet<&String> =
+            plan.iter().map(|e| &e.path).collect();
+        let gone: Vec<String> = self.last_placed.iter()
+            .filter(|e| !new_paths.contains(&e.path))
+            .map(|e| e.path.clone())
+            .collect();
+        if let Some(ref mut display) = self.image_display {
+            for path in &gone {
+                display.forget_path(path);
+            }
+            for e in &plan {
+                display.show_clipped(&e.path, e.x, e.y, e.full_w, e.full_h, e.src_top, e.src_visible);
             }
         }
+        self.last_placed = plan;
     }
 
     /// Check if any new images finished downloading, show them if in viewport
@@ -387,6 +523,20 @@ impl App {
         if let Some(ref mut display) = self.image_display {
             display.clear(self.main.x, self.main.y, self.main.w, self.main.h, self.cols, self.rows);
         }
+        // Forget the placement plan — anything previously on screen
+        // is gone, so the next show_visible_images sees an empty
+        // baseline and re-emits.
+        self.last_placed.clear();
+    }
+
+    /// Single entry point for status-bar prompts. Always re-renders
+    /// the status line afterward so cancelled prompts (ESC → empty
+    /// return) don't leave the temp-bg prompt visible until the next
+    /// unrelated render. Pane.record == true gives Up/Down history.
+    fn prompt(&mut self, label: &str, initial: &str) -> String {
+        let result = self.status.ask_with_bg(label, initial, 18);
+        self.render_status();
+        result
     }
 
     fn render_status(&mut self) {
@@ -552,23 +702,26 @@ impl App {
     // --- Scrolling ---
 
     fn scroll_down(&mut self, n: usize) {
-        // Kitty's classic image placements scroll with the terminal's
-        // DEC scroll region, so if we let scroll_refresh run first the
-        // graphics ride along and only THEN get deleted + re-placed —
-        // producing the illusion that the image stayed pinned to its
-        // original screen row. Clear images BEFORE the scroll, then
-        // re-place from scratch once the text has settled.
-        if self.conf.show_images { self.clear_images(); }
+        // No pre-clear: show_visible_images does a per-image diff and
+        // glow's show() moves an existing kitty placement via per-id
+        // delete + place, which keeps the same image_id (and therefore
+        // the same IMG_SLOT in glass). Pre-clearing all ids would
+        // force fresh ids on every line of scrolling — 3 visible
+        // images × 85 lines = 256 = wedged.
+        let lc = self.tab().content.lines().count();
+        let page = self.main.h as usize;
+        let max_ix = lc.saturating_sub(page);
         let old_ix = self.tabs[self.current_tab].ix;
-        self.tabs[self.current_tab].ix += n;
-        self.main.ix = self.tabs[self.current_tab].ix;
-        let delta = (self.tabs[self.current_tab].ix - old_ix) as i32;
+        if old_ix >= max_ix { return; }
+        let new_ix = (old_ix + n).min(max_ix);
+        self.tabs[self.current_tab].ix = new_ix;
+        self.main.ix = new_ix;
+        let delta = (new_ix - old_ix) as i32;
         self.main.scroll_refresh(delta);
         if self.conf.show_images { self.show_visible_images(); }
     }
 
     fn scroll_up(&mut self, n: usize) {
-        if self.conf.show_images { self.clear_images(); }
         let old_ix = self.tabs[self.current_tab].ix;
         self.tabs[self.current_tab].ix = old_ix.saturating_sub(n);
         self.main.ix = self.tabs[self.current_tab].ix;
@@ -588,7 +741,6 @@ impl App {
     }
 
     fn scroll_bottom(&mut self) {
-        if self.conf.show_images { self.clear_images(); }
         let lc = self.tab().content.lines().count();
         let page = self.main.h as usize;
         self.tabs[self.current_tab].ix = lc.saturating_sub(page);
@@ -599,37 +751,262 @@ impl App {
 
     // --- Tabs ---
 
-    fn next_tab(&mut self) {
-        if self.tabs.len() > 1 {
-            self.current_tab = (self.current_tab + 1) % self.tabs.len();
-            self.render_all();
+    /// Rotate the active tab one position to the right within its set
+    /// (wraps). Other sets' tabs aren't disturbed.
+    fn move_tab_right(&mut self) {
+        let in_set = self.tabs_in_current_set();
+        if in_set.len() <= 1 { return; }
+        let pos = match in_set.iter().position(|&i| i == self.current_tab) {
+            Some(p) => p, None => return,
+        };
+        let next_pos = (pos + 1) % in_set.len();
+        let a = in_set[pos];
+        let b = in_set[next_pos];
+        self.tabs.swap(a, b);
+        self.tab_set.swap(a, b);
+        self.current_tab = b;
+        self.render_all();
+    }
+
+    /// Rotate the active tab one position to the left within its set.
+    fn move_tab_left(&mut self) {
+        let in_set = self.tabs_in_current_set();
+        if in_set.len() <= 1 { return; }
+        let pos = match in_set.iter().position(|&i| i == self.current_tab) {
+            Some(p) => p, None => return,
+        };
+        let n = in_set.len();
+        let prev_pos = (pos + n - 1) % n;
+        let a = in_set[pos];
+        let b = in_set[prev_pos];
+        self.tabs.swap(a, b);
+        self.tab_set.swap(a, b);
+        self.current_tab = b;
+        self.render_all();
+    }
+
+    /// Indices (in `self.tabs`) of tabs in the current set.
+    fn tabs_in_current_set(&self) -> Vec<usize> {
+        (0..self.tabs.len())
+            .filter(|&i| self.tab_set.get(i).copied() == Some(self.current_set))
+            .collect()
+    }
+
+    /// Switch the active set index AND the fetcher's cookie jar so the
+    /// next request uses that set's identity. All set-changing paths
+    /// (next_set, prev_set, new_set, close-tab sync, move-tab-to-set,
+    /// undo-close, etc.) route through this so we can't forget one.
+    fn activate_set(&mut self, new_set: usize) {
+        self.current_set = new_set;
+        if let Some(name) = self.sets.get(new_set) {
+            self.fetcher.set_active_set(name);
         }
+    }
+
+    fn next_tab(&mut self) {
+        let in_set = self.tabs_in_current_set();
+        if in_set.len() <= 1 { return; }
+        let pos = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
+        self.current_tab = in_set[(pos + 1) % in_set.len()];
+        self.render_all();
     }
 
     fn prev_tab(&mut self) {
-        if self.tabs.len() > 1 {
-            self.current_tab = if self.current_tab == 0 { self.tabs.len() - 1 } else { self.current_tab - 1 };
-            self.render_all();
-        }
+        let in_set = self.tabs_in_current_set();
+        if in_set.len() <= 1 { return; }
+        let pos = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
+        let n = in_set.len();
+        self.current_tab = in_set[(pos + n - 1) % n];
+        self.render_all();
     }
 
     fn close_tab(&mut self) {
+        // Closing the only tab anywhere quits the app.
         if self.tabs.len() <= 1 {
             self.running = false;
             return;
         }
         let closed = self.tabs.remove(self.current_tab);
+        let closed_set = self.tab_set.remove(self.current_tab);
         self.closed_tabs.push(closed);
-        if self.current_tab >= self.tabs.len() {
-            self.current_tab = self.tabs.len() - 1;
+        self.closed_tab_sets.push(closed_set);
+        // Pick the next current_tab: prefer something in the current
+        // set; otherwise jump to whatever's around.
+        let in_set = self.tabs_in_current_set();
+        if let Some(&i) = in_set.first() {
+            self.current_tab = i;
+        } else if !self.tabs.is_empty() {
+            // No tabs left in current set — fall through to whatever
+            // index we landed on (clamped). User can switch sets to
+            // find their tabs.
+            if self.current_tab >= self.tabs.len() {
+                self.current_tab = self.tabs.len() - 1;
+            }
+            // Sync current_set to the new current_tab's set so the
+            // tab bar shows the right thing AND so the cookie jar
+            // follows the surviving tab's identity.
+            self.activate_set(self.tab_set[self.current_tab]);
         }
         self.render_all();
     }
 
     fn undo_close_tab(&mut self) {
         if let Some(tab) = self.closed_tabs.pop() {
+            let set = self.closed_tab_sets.pop().unwrap_or(self.current_set);
             self.tabs.insert(self.current_tab + 1, tab);
+            self.tab_set.insert(self.current_tab + 1, set);
             self.current_tab += 1;
+            self.activate_set(set);
+            self.render_all();
+        }
+    }
+
+    // --- Tab sets ---
+
+    fn next_set(&mut self) {
+        if self.sets.is_empty() { return; }
+        self.activate_set((self.current_set + 1) % self.sets.len());
+        // Park current_tab on the first tab of the new set, if any.
+        if let Some(&i) = self.tabs_in_current_set().first() {
+            self.current_tab = i;
+        } else {
+            // No tabs in this set yet — open one so the user can browse.
+            self.tabs.push(Tab::new("about:blank"));
+            self.tab_set.push(self.current_set);
+            self.current_tab = self.tabs.len() - 1;
+            self.navigate(&self.conf.homepage.clone());
+        }
+        self.render_all();
+    }
+
+    fn prev_set(&mut self) {
+        if self.sets.is_empty() { return; }
+        let n = self.sets.len();
+        self.activate_set((self.current_set + n - 1) % n);
+        if let Some(&i) = self.tabs_in_current_set().first() {
+            self.current_tab = i;
+        } else {
+            self.tabs.push(Tab::new("about:blank"));
+            self.tab_set.push(self.current_set);
+            self.current_tab = self.tabs.len() - 1;
+            self.navigate(&self.conf.homepage.clone());
+        }
+        self.render_all();
+    }
+
+    fn rename_set(&mut self) {
+        let cur = self.sets.get(self.current_set).cloned().unwrap_or_default();
+        let name = self.prompt("Rename set: ", &cur);
+        let trimmed = name.trim();
+        if !trimmed.is_empty() && trimmed != cur {
+            self.sets[self.current_set] = trimmed.to_string();
+            // Rename the on-disk cookie jar so the active identity stays
+            // bound to the new set name.
+            self.fetcher.rename_set(&cur, trimmed);
+            config::save_sets(&self.sets);
+        }
+        self.render_all();
+    }
+
+    fn new_set(&mut self) {
+        let name = self.prompt("New set name: ", "");
+        let trimmed = name.trim();
+        if trimmed.is_empty() { return; }
+        self.sets.push(trimmed.to_string());
+        config::save_sets(&self.sets);
+        // activate_set initialises a fresh cookie jar for the new set
+        // (no inheritance), which is exactly what "different identity"
+        // needs.
+        self.activate_set(self.sets.len() - 1);
+        self.tabs.push(Tab::new("about:blank"));
+        self.tab_set.push(self.current_set);
+        self.current_tab = self.tabs.len() - 1;
+        let home = self.conf.homepage.clone();
+        self.navigate(&home);
+        self.render_all();
+    }
+
+    /// Delete the current set: drops every tab in it, removes the set
+    /// from the list, deletes the set's cookie-jar file, and parks on
+    /// another set's first tab. Refuses if it would leave zero sets.
+    /// Confirmation prompt expects exactly "yes" to proceed (so a
+    /// stray Enter or 'y' doesn't blow away an identity).
+    fn delete_current_set(&mut self) {
+        if self.sets.len() <= 1 {
+            self.status.say(" Cannot delete the last remaining set.");
+            return;
+        }
+        let cur_idx = self.current_set;
+        let cur_name = self.sets[cur_idx].clone();
+        let in_set: Vec<usize> = self.tabs_in_current_set();
+        let confirm = self.prompt(
+            &format!(
+                "Delete set \"{}\" and {} tab{}? Type 'yes' to confirm: ",
+                cur_name,
+                in_set.len(),
+                if in_set.len() == 1 { "" } else { "s" },
+            ),
+            "",
+        );
+        if confirm.trim() != "yes" {
+            self.status.say(&format!(" Cancelled — set \"{}\" not deleted", cur_name));
+            return;
+        }
+
+        // 1. Drop every tab in this set (high index first so earlier
+        //    indices don't shift before we remove them).
+        let mut to_drop = in_set.clone();
+        to_drop.sort_unstable();
+        for &i in to_drop.iter().rev() {
+            self.tabs.remove(i);
+            self.tab_set.remove(i);
+        }
+        // Adjust set indices in tab_set: any set index > cur_idx
+        // shifts down by 1 because the set list will lose an entry.
+        for s in self.tab_set.iter_mut() {
+            if *s > cur_idx { *s -= 1; }
+        }
+        // 2. Remove the set itself + its cookie-jar file on disk.
+        self.sets.remove(cur_idx);
+        let jar_path = config::cookie_jar_path(&cur_name);
+        let _ = std::fs::remove_file(&jar_path);
+        config::save_sets(&self.sets);
+
+        // 3. Pick a destination set: prefer the same-position index,
+        //    falling back to the last available.
+        let new_set = cur_idx.min(self.sets.len() - 1);
+        // Make sure the destination has at least one tab; if not,
+        // open the homepage there.
+        let has_tab = self.tab_set.iter().any(|&s| s == new_set);
+        if !has_tab {
+            self.tabs.push(Tab::new("about:blank"));
+            self.tab_set.push(new_set);
+        }
+        self.activate_set(new_set);
+        // 4. Park current_tab on the first tab of the destination set.
+        let dest_first = self.tab_set.iter().position(|&s| s == new_set).unwrap_or(0);
+        self.current_tab = dest_first;
+        // Out-of-band navigation if we just opened a blank one.
+        if !has_tab {
+            let home = self.conf.homepage.clone();
+            self.navigate(&home);
+        }
+        self.render_all();
+        self.status.say(&format!(" Deleted set \"{}\"", cur_name));
+    }
+
+    /// Move the currently active tab to a different set. Prompts for
+    /// the target set name (case-insensitive prefix match).
+    fn move_tab_to_set(&mut self) {
+        let names = self.sets.join(", ");
+        let prompt = format!("Move to set ({}): ", names);
+        let answer = self.prompt(&prompt, "");
+        let q = answer.trim().to_lowercase();
+        if q.is_empty() { return; }
+        let target = self.sets.iter().position(|n| n.to_lowercase().starts_with(&q));
+        if let Some(t) = target {
+            self.tab_set[self.current_tab] = t;
+            self.activate_set(t);
             self.render_all();
         }
     }
@@ -637,7 +1014,7 @@ impl App {
     // --- URL prompts ---
 
     fn open_url_prompt(&mut self) {
-        let url = self.status.ask_with_bg("Open: ", "", 18);
+        let url = self.prompt("Open: ", "");
         if !url.is_empty() {
             self.navigate(&url);
         }
@@ -645,16 +1022,17 @@ impl App {
 
     fn edit_url_prompt(&mut self) {
         let current = self.tab().url.clone();
-        let url = self.status.ask_with_bg("Open: ", &current, 18);
+        let url = self.prompt("Open: ", &current);
         if !url.is_empty() {
             self.navigate(&url);
         }
     }
 
     fn open_in_new_tab(&mut self) {
-        let url = self.status.ask_with_bg("Tab open: ", "", 18);
+        let url = self.prompt("Tab open: ", "");
         if !url.is_empty() {
             self.tabs.push(Tab::new("about:blank"));
+            self.tab_set.push(self.current_set);
             self.current_tab = self.tabs.len() - 1;
             self.navigate(&url);
         }
@@ -706,7 +1084,22 @@ impl App {
             style::fg(&href, 245)));
     }
 
-    /// ENTER: if focused on a link, follow it. Otherwise prompt for link number.
+    /// Open `href` in a freshly-spawned tab parked in the current set,
+    /// switch to it, and start the navigation. Same recipe used by
+    /// `open_in_new_tab` but accepts a pre-resolved URL — keeps the
+    /// link-prompt and focused-link paths in sync.
+    fn open_href_in_new_tab(&mut self, href: &str) {
+        self.tabs.push(Tab::new("about:blank"));
+        self.tab_set.push(self.current_set);
+        self.current_tab = self.tabs.len() - 1;
+        self.navigate(href);
+    }
+
+    /// ENTER: if focused on a link, follow it. Otherwise prompt for
+    /// link number. The prompt accepts a trailing `t` to open the
+    /// link in a new tab instead of replacing the current one
+    /// (e.g. `42t` = "open link 42 in a new tab"). Bare `42` keeps
+    /// the original semantics (current tab).
     fn follow_focused(&mut self) {
         if self.focus_index >= 0 {
             let idx = self.focus_index as usize;
@@ -717,17 +1110,45 @@ impl App {
                 return;
             }
         }
-        // Prompt for link number
-        let input = self.status.ask_with_bg("Link #: ", "", 18);
-        if input.is_empty() { return; }
-        if let Ok(num) = input.parse::<usize>() {
-            if let Some(link) = self.tabs[self.current_tab].links.iter().find(|l| l.index == num) {
-                let href = link.href.clone();
-                self.navigate(&href);
-            } else {
-                self.status.say(&style::fg(&format!(" Link {} not found", num), 196));
-            }
+        // Prompt for link number; trailing 't' = tab-open
+        let input = self.prompt("Link #: ", "");
+        let trimmed = input.trim();
+        if trimmed.is_empty() { return; }
+        let (num_str, tab_open) = if let Some(rest) = trimmed.strip_suffix(|c: char| c == 't' || c == 'T') {
+            (rest.trim_end(), true)
+        } else if let Some(rest) = trimmed.strip_prefix(|c: char| c == 't' || c == 'T') {
+            (rest.trim_start(), true)
+        } else {
+            (trimmed, false)
+        };
+        let Ok(num) = num_str.parse::<usize>() else {
+            self.status.say(&style::fg(&format!(" Invalid link spec: {}", trimmed), 196));
+            return;
+        };
+        let Some(href) = self.tabs[self.current_tab].links.iter()
+            .find(|l| l.index == num)
+            .map(|l| l.href.clone())
+        else {
+            self.status.say(&style::fg(&format!(" Link {} not found", num), 196));
+            return;
+        };
+        if tab_open {
+            self.open_href_in_new_tab(&href);
+        } else {
+            self.navigate(&href);
         }
+    }
+
+    /// `T` on a focused link: open it in a new tab. Mirrors the `t`
+    /// suffix in the link-number prompt so muscle memory works either
+    /// direction (Tab-cycle a link then `T`, or `Enter 42t`).
+    fn tabopen_focused(&mut self) {
+        if self.focus_index < 0 { return; }
+        let idx = self.focus_index as usize;
+        let n_links = self.tabs[self.current_tab].links.len();
+        if idx >= n_links { return; }
+        let href = self.tabs[self.current_tab].links[idx].href.clone();
+        self.open_href_in_new_tab(&href);
     }
 
     fn fill_form(&mut self) {
@@ -735,27 +1156,34 @@ impl App {
         let form = self.tab().forms[0].clone();
         let mut params = HashMap::new();
 
+        // Resolve credentials for the current host once — used to
+        // pre-fill both username-shaped fields AND password fields.
+        let host = url::Url::parse(&self.tab().url).ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()));
+        let creds: Option<(String, String)> = host.as_ref().and_then(|h| self.lookup_password(h));
+
         for field in &form.fields {
             match field.field_type.as_str() {
                 "hidden" => { params.insert(field.name.clone(), field.value.clone()); }
                 "password" => {
-                    let val = self.status.ask_with_bg(&format!("{}: ", field.name), "", 18);
+                    let default = creds.as_ref().map(|(_, p)| p.clone()).unwrap_or_default();
+                    let val = self.prompt(&format!("{}: ", field.name), &default);
                     params.insert(field.name.clone(), val);
                 }
                 "select" => {
                     let options: Vec<String> = field.options.iter().map(|(_, l)| l.clone()).collect();
-                    let val = self.status.ask_with_bg(&format!("{} ({}): ", field.name, options.join("/")), "", 18);
+                    let val = self.prompt(&format!("{} ({}): ", field.name, options.join("/")), "");
                     params.insert(field.name.clone(), val);
                 }
                 _ => {
-                    let domain = url::Url::parse(&self.tab().url).ok()
-                        .and_then(|u| u.host_str().map(|h| h.to_string()));
-                    let autofill = domain.as_ref()
-                        .and_then(|d| self.passwords.get(d))
-                        .filter(|_| field.name.contains("user") || field.name.contains("email") || field.name.contains("login"))
+                    let is_userish = field.name.contains("user")
+                        || field.name.contains("email")
+                        || field.name.contains("login");
+                    let autofill = creds.as_ref()
+                        .filter(|_| is_userish)
                         .map(|(u, _)| u.clone());
                     let default = autofill.unwrap_or_else(|| field.value.clone());
-                    let val = self.status.ask_with_bg(&format!("{}: ", field.placeholder), &default, 18);
+                    let val = self.prompt(&format!("{}: ", field.placeholder), &default);
                     params.insert(field.name.clone(), val);
                 }
             }
@@ -788,7 +1216,7 @@ impl App {
     // --- Search ---
 
     fn search_prompt(&mut self) {
-        let term = self.status.ask_with_bg("/", "", 18);
+        let term = self.prompt("/", "");
         if term.is_empty() { return; }
         self.search_term = term.to_lowercase();
         self.search_matches.clear();
@@ -1037,67 +1465,135 @@ impl App {
     // --- Help ---
 
     fn show_help(&mut self) {
-        let help = format!("{}\n\n\
-{}\n\
-  j/k           Scroll down/up\n\
-  Space/PgDn    Page down\n\
-  PgUp          Page up\n\
-  gg            Go to top\n\
-  G             Go to bottom\n\
-  C-D/C-U       Half page down/up\n\
-  </> arrow     Scroll left/right\n\n\
-{}\n\
-  o             Open URL\n\
-  O             Edit current URL\n\
-  t             Open in new tab\n\
-  H/Backspace   Go back\n\
-  L/Delete      Go forward\n\
-  r             Reload\n\n\
-{}\n\
-  J/Right       Next tab\n\
-  K/Left        Previous tab\n\
-  d             Close tab\n\
-  u             Undo close\n\n\
-{}\n\
-  Tab/S-Tab     Next/prev link or field\n\
-  Enter         Follow link / edit field\n\
-  f             Fill and submit form\n\
-  e             Edit page source in $EDITOR\n\
-  C-G           Edit form field in $EDITOR\n\
-  p             Show password for site\n\
-  y             Copy page URL\n\
-  Y             Copy focused link URL\n\n\
-{}\n\
-  /             Search page\n\
-  n/N           Next/prev match\n\n\
-{}\n\
-  b             Bookmark page\n\
-  B             Show bookmarks\n\
-  m + key       Set quickmark\n\
-  ' + key       Go to quickmark\n\n\
-{}\n\
-  i             Toggle images\n\
-  I             AI page summary\n\
-  P             Preferences\n\
-  C-L           Force redraw\n\
-  :             Command mode\n\
-  q             Quit\n\n\
-{}\n\
-  :password     Save credentials for site\n\
-  :adblock      Update ad block list",
-            style::bold("Scroll - Terminal Web Browser"),
-            style::fg("Scrolling", 220),
-            style::fg("Navigation", 220),
-            style::fg("Tabs", 220),
-            style::fg("Links & Forms", 220),
-            style::fg("Search", 220),
-            style::fg("Bookmarks", 220),
-            style::fg("Other", 220),
-            style::fg("Commands", 220),
-        );
-        self.tab_mut().content = help;
-        self.tab_mut().ix = 0;
-        self.render_main();
+        // Build the help content from the current keymap. Sections
+        // mirror the dispatcher in main(); when keys change there,
+        // update them here too. Grouped to fit a centered popup.
+        let h = |t: &str| style::fg(&style::bold(t), 220);
+        let lines: Vec<String> = vec![
+            format!(" {}", style::fg(&style::bold("Scroll — Terminal Web Browser"), 81)),
+            String::new(),
+            format!(" {}", h("Scrolling")),
+            "   j / k   ↓ / ↑      line down / up".into(),
+            "   Space / PgDn       page down".into(),
+            "   PgUp               page up".into(),
+            "   C-d / C-u          half-page down / up".into(),
+            "   gg / G  Home/End   top / bottom".into(),
+            "   < / >              horizontal scroll".into(),
+            String::new(),
+            format!(" {}", h("Tabs")),
+            "   →  /  ←            next / prev tab in current set".into(),
+            "   S-→ / S-←          move active tab right / left".into(),
+            "   t                  open in new tab".into(),
+            "   d                  close tab".into(),
+            "   u                  undo close".into(),
+            String::new(),
+            format!(" {}", h("Sets (per-set cookie jars / identities)")),
+            "   C-→ / C-←          next / prev set".into(),
+            "   gn                 rename current set".into(),
+            "   gN                 new set".into(),
+            "   gm                 move active tab to another set".into(),
+            "   D                  delete current set (with confirmation)".into(),
+            String::new(),
+            format!(" {}", h("Navigation")),
+            "   o                  open URL".into(),
+            "   O                  edit current URL".into(),
+            "   H  /  Backspace    back".into(),
+            "   L  /  Delete       forward".into(),
+            "   r                  reload".into(),
+            String::new(),
+            format!(" {}", h("Links & forms")),
+            "   Tab / S-Tab        focus next / prev link or field".into(),
+            "   Enter              follow focused link / edit field".into(),
+            "   Enter then NN      follow link by [N] number (e.g. 42)".into(),
+            "   Enter then NNt     open link [N] in a new tab (e.g. 42t)".into(),
+            "   T                  open focused link in a new tab".into(),
+            "   f                  fill and submit form".into(),
+            "   e                  edit page source in $EDITOR".into(),
+            "   C-g                edit focused form field in $EDITOR".into(),
+            "   p                  show stored password for site".into(),
+            "   y / Y              copy page URL / focused link URL".into(),
+            String::new(),
+            format!(" {}", h("Search")),
+            "   /                  search page".into(),
+            "   n / N              next / prev match".into(),
+            String::new(),
+            format!(" {}", h("Bookmarks & quickmarks")),
+            "   b                  bookmark current page".into(),
+            "   B                  show bookmarks".into(),
+            "   m{key}             set quickmark".into(),
+            "   '{key}             go to quickmark".into(),
+            String::new(),
+            format!(" {}", h("Other")),
+            "   i                  toggle images".into(),
+            "   I                  AI page summary".into(),
+            "   P                  preferences".into(),
+            "   C-l                hard redraw (resets kitty image state)".into(),
+            "   :                  command mode (see below)".into(),
+            "   ?                  this help".into(),
+            "   q                  quit".into(),
+            String::new(),
+            format!(" {}", h(":commands")),
+            "   :back / :forward / :reload / :help".into(),
+            "   :password          save credentials for current site".into(),
+            "   :adblock           update ad-block list".into(),
+            String::new(),
+            style::fg(" j/k or ↓/↑ scroll · ESC / q / ? close", 245),
+        ];
+
+        let pw = 72u16.min(self.cols.saturating_sub(4));
+        let ph = 28u16.min(self.rows.saturating_sub(4));
+        let px = (self.cols.saturating_sub(pw)) / 2;
+        let py = (self.rows.saturating_sub(ph)) / 2;
+        let mut popup = Pane::new(px, py, pw, ph, 255, 235);
+        popup.border = true;
+        popup.scroll = true;
+        popup.set_text(&lines.join("\n"));
+        popup.ix = 0;
+        popup.border_refresh();
+        popup.full_refresh();
+
+        loop {
+            let Some(key) = Input::getchr(None) else { continue };
+            match key.as_str() {
+                "ESC" | "q" | "?" => break,
+                "j" | "DOWN" => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    if (popup.ix as u16) + view < total {
+                        popup.ix += 1;
+                        popup.full_refresh();
+                    }
+                }
+                "k" | "UP" => {
+                    if popup.ix > 0 { popup.ix -= 1; popup.full_refresh(); }
+                }
+                "PgDOWN" | " " => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    let step = view as usize;
+                    if (popup.ix as u16) + view < total {
+                        popup.ix = ((popup.ix + step) as u16).min(total.saturating_sub(view)) as usize;
+                        popup.full_refresh();
+                    }
+                }
+                "PgUP" => {
+                    let view = ph.saturating_sub(2) as usize;
+                    popup.ix = popup.ix.saturating_sub(view);
+                    popup.full_refresh();
+                }
+                "g" => { popup.ix = 0; popup.full_refresh(); }
+                "G" => {
+                    let total = lines.len() as u16;
+                    let view = ph.saturating_sub(2);
+                    popup.ix = total.saturating_sub(view) as usize;
+                    popup.full_refresh();
+                }
+                _ => {}
+            }
+        }
+
+        // Restore the page underneath.
+        self.render_all();
     }
 
     // --- AI ---
@@ -1145,7 +1641,7 @@ impl App {
     // --- Command mode ---
 
     fn command_mode(&mut self) {
-        let cmd = self.status.ask_with_bg(":", "", 18);
+        let cmd = self.prompt(":", "");
         if cmd.is_empty() { return; }
 
         let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
@@ -1157,6 +1653,7 @@ impl App {
             "tabopen" | "to" => {
                 if !args.is_empty() {
                     self.tabs.push(Tab::new("about:blank"));
+                    self.tab_set.push(self.current_set);
                     self.current_tab = self.tabs.len() - 1;
                     self.navigate(args);
                 }
@@ -1215,6 +1712,24 @@ impl App {
     }
 
     fn force_redraw(&mut self) {
+        // Step 1: hard-reset the terminal's kitty graphics state.
+        // `\x1b_Ga=d\x1b\\` (no `d=`) tells kitty/glass to free EVERY
+        // image record. This unsticks glass when its IMG_SLOTS table
+        // (capped at 32) has filled up and silently dropped placements.
+        // Without this, force_redraw just re-runs the same churn that
+        // wedged the state in the first place.
+        use std::io::Write as _;
+        print!("\x1b_Ga=d\x1b\\");
+        let _ = std::io::stdout().flush();
+
+        // Step 2: drop and re-create our glow::Display so the local
+        // image_cache + active_ids tables also start clean. Without
+        // this, scroll's cached IDs from before the reset would be
+        // treated as live and skip re-transmission.
+        if self.image_display.is_some() {
+            self.image_display = Some(glow::Display::with_mode(&self.conf.image_mode));
+        }
+
         Crust::clear_screen();
         self.render_all();
     }
@@ -1273,7 +1788,7 @@ impl App {
             let names: Vec<String> = editable.iter().enumerate()
                 .map(|(i, (_, name, _))| format!("{}: {}", i + 1, name))
                 .collect();
-            let input = self.status.ask_with_bg(&format!("Field ({}) #: ", names.join(", ")), "", 18);
+            let input = self.prompt(&format!("Field ({}) #: ", names.join(", ")), "");
             if input.is_empty() { return; }
             match input.parse::<usize>() {
                 Ok(n) if n >= 1 && n <= editable.len() => editable[n - 1].0,
@@ -1309,11 +1824,40 @@ impl App {
             self.status.say(&style::fg(" No host", 220));
             return;
         };
-        if let Some((user, pass)) = self.passwords.get(&host) {
+        if let Some((user, pass)) = self.lookup_password(&host) {
             self.status.say(&format!(" {} - user: {} pass: {}", host, user, pass));
         } else {
             self.status.say(&style::fg(&format!(" No password for {}", host), 220));
         }
+    }
+
+    /// Resolve a (username, password) for `host`. Tries the external
+    /// `password_command` first if configured; falls back to the
+    /// internal `passwords.json` store. The external command is
+    /// invoked as `<cmd> <host>` and must print two lines on stdout:
+    /// `username\npassword\n`.
+    fn lookup_password(&self, host: &str) -> Option<(String, String)> {
+        if !self.conf.password_command.is_empty() {
+            // Run the configured command. Allow shell expansion via
+            // `sh -c "<cmd> <host>"` so users can drop a one-liner
+            // (pipes, env, etc.) into the config without shellsplit.
+            let escaped_host = host.replace('\'', "'\\''");
+            let cmdline = format!("{} '{}'", self.conf.password_command, escaped_host);
+            if let Ok(out) = std::process::Command::new("sh")
+                .arg("-c").arg(&cmdline).output()
+            {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout);
+                    let mut lines = s.lines();
+                    if let (Some(u), Some(p)) = (lines.next(), lines.next()) {
+                        if !u.is_empty() && !p.is_empty() {
+                            return Some((u.to_string(), p.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        self.passwords.get(host).cloned()
     }
 
     fn save_password_cmd(&mut self) {
@@ -1339,9 +1883,9 @@ impl App {
         let host = url::Url::parse(&self.tab().url).ok()
             .and_then(|u| u.host_str().map(|h| h.to_string()));
         if let Some(host) = host {
-            if self.passwords.contains_key(&host) {
+            if self.lookup_password(&host).is_some() {
                 self.status.say(&style::fg(
-                    &format!(" Credentials available for {}. Press 'f' to fill form.", host), 82));
+                    &format!(" Credentials available for {}. Press 'C-F' to fill form.", host), 82));
             }
         }
     }

@@ -3,8 +3,17 @@ use std::fs;
 use std::io::Read;
 use crate::config;
 
+/// Cookie jar: domain → {name → value}. One per tab-set so the user
+/// can be logged in as different identities in different sets.
+type CookieJar = HashMap<String, HashMap<String, String>>;
+
 pub struct Fetcher {
-    cookies: HashMap<String, HashMap<String, String>>,
+    /// All loaded jars, keyed by set name. Lazy-loaded on first
+    /// `set_active_set` for that set.
+    jars: HashMap<String, CookieJar>,
+    /// Which set's jar is currently active for outgoing requests and
+    /// incoming Set-Cookie storage. Always present in `jars`.
+    active_set: String,
     cache: HashMap<String, FetchResult>,
     cache_order: Vec<String>,  // LRU order for eviction
     max_cache: usize,
@@ -19,13 +28,75 @@ pub struct FetchResult {
 }
 
 impl Fetcher {
-    pub fn new() -> Self {
-        let cookies = config::cookies_path()
+    /// Construct a fetcher with `set_name` as the active cookie jar.
+    /// On first run, migrates any pre-existing single-jar
+    /// `~/.scroll/cookies.json` into `~/.scroll/cookies/<set_name>.json`
+    /// so existing logins survive the per-set isolation upgrade.
+    pub fn new_with_set(set_name: &str) -> Self {
+        Self::migrate_legacy_cookies_jar(set_name);
+        let mut jars: HashMap<String, CookieJar> = HashMap::new();
+        jars.insert(set_name.to_string(), Self::load_jar(set_name));
+        Fetcher {
+            jars,
+            active_set: set_name.to_string(),
+            cache: HashMap::new(),
+            cache_order: Vec::new(),
+            max_cache: 20,
+        }
+    }
+
+    fn load_jar(set_name: &str) -> CookieJar {
+        config::cookie_jar_path(set_name)
             .to_str()
             .and_then(|p| fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        Fetcher { cookies, cache: HashMap::new(), cache_order: Vec::new(), max_cache: 20 }
+            .unwrap_or_default()
+    }
+
+    fn migrate_legacy_cookies_jar(default_set: &str) {
+        let legacy = config::cookies_path();
+        let dest = config::cookie_jar_path(default_set);
+        if legacy.exists() && !dest.exists() {
+            let _ = fs::create_dir_all(config::cookies_dir());
+            let _ = fs::rename(&legacy, &dest);
+        }
+    }
+
+    /// Switch the active jar. Saves whatever was just being used,
+    /// loads (or initialises) the destination.
+    pub fn set_active_set(&mut self, set_name: &str) {
+        if self.active_set == set_name { return; }
+        self.save_active_jar();
+        if !self.jars.contains_key(set_name) {
+            self.jars.insert(set_name.to_string(), Self::load_jar(set_name));
+        }
+        self.active_set = set_name.to_string();
+    }
+
+    /// Rename a set's jar file when the user renames the set.
+    pub fn rename_set(&mut self, old_name: &str, new_name: &str) {
+        if old_name == new_name { return; }
+        if let Some(jar) = self.jars.remove(old_name) {
+            self.jars.insert(new_name.to_string(), jar);
+        }
+        if self.active_set == old_name {
+            self.active_set = new_name.to_string();
+        }
+        let old_path = config::cookie_jar_path(old_name);
+        let new_path = config::cookie_jar_path(new_name);
+        if old_path.exists() {
+            let _ = fs::create_dir_all(config::cookies_dir());
+            let _ = fs::rename(&old_path, &new_path);
+        }
+    }
+
+    fn save_active_jar(&self) {
+        if let Some(jar) = self.jars.get(&self.active_set) {
+            if let Ok(json) = serde_json::to_string_pretty(jar) {
+                let _ = fs::create_dir_all(config::cookies_dir());
+                let _ = fs::write(config::cookie_jar_path(&self.active_set), json);
+            }
+        }
     }
 
     pub fn fetch(&mut self, url: &str, method: &str, params: Option<&HashMap<String, String>>) -> FetchResult {
@@ -79,16 +150,18 @@ impl Fetcher {
             .set("Accept", "text/html,application/xhtml+xml,*/*")
             .set("Accept-Language", "en-US,en;q=0.9");
 
-        // Add cookies
+        // Add cookies from the active set's jar.
         if let Ok(parsed) = url::Url::parse(&fetch_url) {
             if let Some(domain) = parsed.host_str() {
-                if let Some(domain_cookies) = self.cookies.get(domain) {
-                    let cookie_str: String = domain_cookies.iter()
-                        .map(|(k, v)| format!("{}={}", k, v))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    if !cookie_str.is_empty() {
-                        req = req.set("Cookie", &cookie_str);
+                if let Some(jar) = self.jars.get(&self.active_set) {
+                    if let Some(domain_cookies) = jar.get(domain) {
+                        let cookie_str: String = domain_cookies.iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        if !cookie_str.is_empty() {
+                            req = req.set("Cookie", &cookie_str);
+                        }
                     }
                 }
             }
@@ -197,19 +270,15 @@ impl Fetcher {
                 if let Some(val) = resp.header("set-cookie") {
                     if let Some((name_val, _)) = val.split_once(';') {
                         if let Some((name, value)) = name_val.split_once('=') {
-                            let entry = self.cookies.entry(domain.to_string()).or_default();
+                            let active = self.active_set.clone();
+                            let jar = self.jars.entry(active).or_default();
+                            let entry = jar.entry(domain.to_string()).or_default();
                             entry.insert(name.trim().to_string(), value.trim().to_string());
                         }
                     }
                 }
-                self.save_cookies();
+                self.save_active_jar();
             }
-        }
-    }
-
-    fn save_cookies(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.cookies) {
-            let _ = fs::write(config::cookies_path(), json);
         }
     }
 }
