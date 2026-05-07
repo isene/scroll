@@ -167,6 +167,23 @@ pub struct Config {
     ///   "PassionFruits" → "/home/geir/.mozilla/firefox/abc.passionfruits"
     #[serde(default)]
     pub firefox_profiles: HashMap<String, String>,
+    /// User-Agent string used by the headless Servo helper (`:servo`).
+    /// scroll's own fast-path fetcher uses rquest's bundled Firefox
+    /// emulation profile (which packages UA + TLS + HTTP/2 together —
+    /// changing the UA there would break JA3/UA fingerprint match and
+    /// invalidate any imported `cf_clearance` cookie).
+    /// Default matches Firefox 150 on Linux; bump in lockstep with
+    /// the user's installed Firefox so cookies imported from FF travel
+    /// against the same UA the server saw at login time.
+    #[serde(default = "default_user_agent")]
+    pub user_agent: String,
+}
+
+fn default_user_agent() -> String {
+    // Firefox 150 on Linux x86_64 — matches the user's locally-installed
+    // build so the cookies imported from FF travel against a UA the
+    // server saw at login time. Bump in lockstep with FF major releases.
+    "Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0".into()
 }
 
 fn default_homepage() -> String { "about:home".into() }

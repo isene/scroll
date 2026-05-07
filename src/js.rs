@@ -19,7 +19,7 @@
 //!   plus no-op `click` / `submit` / `focus` / `blur` /
 //!   `dispatchEvent` / `addEventListener`. JS-set values surface
 //!   back via `JsResult.dom_values`.
-//! - `fetch(url, opts)` runs synchronously through ureq, sends the
+//! - `fetch(url, opts)` runs synchronously through rquest, sends the
 //!   active set's cookies, captures `Set-Cookie` from the response.
 //!   Returns a Response-shaped object with `.status` / `.ok` /
 //!   `.text()` / `.json()`. Each method returns a thenable so
@@ -497,25 +497,39 @@ fn absolute_url(base: &str, href: &str) -> String {
     href.to_string()
 }
 
+/// Construct a fresh tokio runtime + Firefox-emulating rquest client.
+/// Both are cheap (sub-ms) and short-lived; we don't try to share a
+/// long-lived client across the JS layer because the JS fetch path is
+/// reentered from many call sites and a thread-local would just hide
+/// lifetime tangles for negligible win.
+fn make_http() -> Option<(tokio::runtime::Runtime, rquest::Client)> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    let client = rquest::Client::builder()
+        .emulation(rquest_util::Emulation::Firefox136)
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(rquest::redirect::Policy::limited(10))
+        .build()
+        .ok()?;
+    Some((rt, client))
+}
+
 fn fetch_script(url: &str, cookies: &HashMap<String, String>, budget: usize) -> Option<String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(5))
-        .timeout_read(std::time::Duration::from_secs(5))
-        .redirects(5)
-        .build();
-    let mut req = agent.get(url)
-        .set("User-Agent", "scroll/0.2 (terminal browser)")
-        .set("Accept", "*/*");
-    if !cookies.is_empty() {
-        let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
-        req = req.set("Cookie", &cs);
-    }
-    let resp = req.call().ok()?;
-    let mut body = String::new();
-    use std::io::Read;
-    let mut reader = resp.into_reader().take(budget as u64);
-    reader.read_to_string(&mut body).ok()?;
-    Some(body)
+    let (rt, client) = make_http()?;
+    rt.block_on(async {
+        let mut req = client.get(url);
+        if !cookies.is_empty() {
+            let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
+            req = req.header("Cookie", cs);
+        }
+        let resp = req.send().await.ok()?;
+        let bytes = resp.bytes().await.ok()?;
+        // Cap to budget so a runaway CDN can't fill memory.
+        let take = bytes.len().min(budget);
+        Some(String::from_utf8_lossy(&bytes[..take]).into_owned())
+    })
 }
 
 
@@ -879,43 +893,38 @@ fn do_fetch(ctx: &mut Context, url: &str, opts: Option<JsValue>) -> BoaResult<Js
         }
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(10))
-        .redirects(5)
-        .build();
-    let mut req = match method.as_str() {
-        "POST" => agent.post(&absolute),
-        "PUT" => agent.put(&absolute),
-        "DELETE" => agent.delete(&absolute),
-        _ => agent.get(&absolute),
-    };
-    req = req.set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36");
-    for (k, v) in &headers { req = req.set(k, v); }
-    if !cookies.is_empty() {
-        let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
-        req = req.set("Cookie", &cs);
-    }
-
-    let resp = match body {
-        Some(b) => req.send_string(&b),
-        None => req.call(),
-    };
-    let (status, body_text, set_cookie) = match resp {
-        Ok(r) => {
-            let status = r.status();
-            let sc = r.header("set-cookie").map(String::from);
-            let body = r.into_string().unwrap_or_default();
-            (status, body, sc)
-        }
-        Err(ureq::Error::Status(code, r)) => {
-            let body = r.into_string().unwrap_or_default();
-            (code, body, None)
-        }
-        Err(e) => {
-            record_log("error", &format!("fetch {} failed: {}", absolute, e));
-            (0, String::new(), None)
-        }
+    let (status, body_text, set_cookie) = match make_http() {
+        Some((rt, client)) => rt.block_on(async {
+            let m = match method.as_str() {
+                "POST" => rquest::Method::POST,
+                "PUT" => rquest::Method::PUT,
+                "DELETE" => rquest::Method::DELETE,
+                _ => rquest::Method::GET,
+            };
+            let mut req = client.request(m, &absolute);
+            for (k, v) in &headers { req = req.header(k.as_str(), v.as_str()); }
+            if !cookies.is_empty() {
+                let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
+                req = req.header("Cookie", cs);
+            }
+            if let Some(b) = body { req = req.body(b); }
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let sc = resp.headers()
+                        .get(rquest::header::SET_COOKIE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(String::from);
+                    let body = resp.text().await.unwrap_or_default();
+                    (status, body, sc)
+                }
+                Err(e) => {
+                    record_log("error", &format!("fetch {} failed: {}", absolute, e));
+                    (0, String::new(), None)
+                }
+            }
+        }),
+        None => (0, String::new(), None),
     };
 
     // Capture any Set-Cookie header into our cookie state so the JS
@@ -1552,12 +1561,11 @@ mod live_passionfruits {
     #[test]
     #[ignore]
     fn passionfruits_full_pipeline() {
-        let html = match ureq::get("https://passionfruits.net/")
-            .set("User-Agent", "Mozilla/5.0 scroll-test")
-            .call()
-        {
-            Ok(r) => r.into_string().unwrap_or_default(),
-            Err(e) => { eprintln!("network fail: {}", e); return; }
+        let html = match make_http().and_then(|(rt, c)| {
+            rt.block_on(async { c.get("https://passionfruits.net/").send().await.ok()?.text().await.ok() })
+        }) {
+            Some(s) => s,
+            None => { eprintln!("network fail"); return; }
         };
         let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
         eprintln!("redirect = {:?}", r.redirect);
@@ -1595,12 +1603,11 @@ mod live_passionfruits {
     #[test]
     #[ignore]
     fn dump_extracted_text() {
-        let html = match ureq::get("https://passionfruits.net/")
-            .set("User-Agent", "Mozilla/5.0 scroll-test")
-            .call()
-        {
-            Ok(r) => r.into_string().unwrap_or_default(),
-            Err(e) => { eprintln!("network fail: {}", e); return; }
+        let html = match make_http().and_then(|(rt, c)| {
+            rt.block_on(async { c.get("https://passionfruits.net/").send().await.ok()?.text().await.ok() })
+        }) {
+            Some(s) => s,
+            None => { eprintln!("network fail"); return; }
         };
         let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
         eprintln!("--- inner_html_changes ({}) ---", r.inner_html_changes.len());

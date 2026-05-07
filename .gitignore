@@ -1,2 +1,5 @@
 /target/
 CLAUDE.md
+# Local-only bindgen workaround for the BoringSSL build (rquest).
+# Pins to the user's gcc resource-headers path; not portable.
+/.cargo/config.toml

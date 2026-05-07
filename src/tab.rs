@@ -29,6 +29,11 @@ pub struct Tab {
     /// back into `js::run_extracted` so the DOM seed (id → element
     /// map) reflects the actual page.
     pub raw_html: String,
+    /// True if the tab's current content was painted by the Servo
+    /// daemon (via `:servo` / `S`). Reset by any subsequent
+    /// non-Servo navigation. The renderer uses this to mark the tab
+    /// visually so the user knows which engine is active.
+    pub servo_rendered: bool,
 }
 
 #[derive(Clone)]
@@ -90,6 +95,7 @@ impl Tab {
             js_log: Vec::new(),
             js_scripts: Vec::new(),
             raw_html: String::new(),
+            servo_rendered: false,
         }
     }
 

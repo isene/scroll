@@ -12,6 +12,7 @@ fn sel_img() -> &'static scraper::Selector { static S: OnceLock<scraper::Selecto
 fn sel_option() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("option").unwrap()) }
 fn sel_tr() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("tr").unwrap()) }
 fn sel_td_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("td, th").unwrap()) }
+fn sel_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("th").unwrap()) }
 fn sel_style() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("style").unwrap()) }
 
 pub struct RenderResult {
@@ -111,7 +112,17 @@ pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::confi
         .map(|t| t.text().collect::<String>().trim().to_string())
         .unwrap_or_default();
 
-    let (site_bg, site_fg) = extract_site_colors(&doc, html);
+    // Skip site-color extraction for `file://` URLs. Those are
+    // typically locally-generated documents (kastrup-launched email
+    // HTML, exported reports, etc.) whose CSS is calibrated for an
+    // email client / browser white background. In a terminal, the
+    // user's configured content fg/bg gives much better contrast
+    // than whatever #fafafa-on-#333 the email author chose.
+    let (site_bg, site_fg) = if base_url.starts_with("file://") {
+        (None, None)
+    } else {
+        extract_site_colors(&doc, html)
+    };
 
     if let Some(body) = doc.select(sel_body()).next() {
         walk_element(&body, &mut ctx);
@@ -514,6 +525,22 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
+    // Heuristic: a real data table has at least one `<th>`. Tables
+    // without `<th>` are almost always *layout tables* — common in
+    // email HTML (GitHub invitations, newsletters, etc.) where the
+    // markup is `<table><tr><td><a href=...>` and the box-drawing
+    // rendering would flatten all the anchors to plain text. Walk the
+    // children inline instead so links and other elements survive.
+    let has_th = el.select(sel_th()).next().is_some();
+    if !has_th {
+        for row in el.select(sel_tr()) {
+            for cell in row.select(sel_td_th()) {
+                walk_element(&cell, ctx);
+            }
+        }
+        return;
+    }
+
     let mut rows: Vec<Vec<String>> = Vec::new();
     for row in el.select(sel_tr()) {
         let cells: Vec<String> = row.select(sel_td_th())

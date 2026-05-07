@@ -2,7 +2,17 @@ mod config;
 mod fetcher;
 mod js;
 mod renderer;
+mod servo_daemon;
 mod tab;
+
+/// One position the TAB cursor can stop at: an `<a>` link or an
+/// editable form field. `Field` carries indices into the tab's
+/// forms/fields so we can resolve a CSS selector at click/type time.
+#[derive(Clone, Copy, Debug)]
+enum FocusItem {
+    Link(usize),
+    Field { form: usize, field: usize },
+}
 
 use crust::{Crust, Pane, Input};
 use crust::style;
@@ -44,6 +54,23 @@ struct App {
     rows: u16,
     conf: Config,
     fetcher: Fetcher,
+    /// Lazy client for the long-running Servo daemon. The first
+    /// `:servo` / `:S` call spawns the daemon; subsequent calls
+    /// reuse the connection. Memory + CPU stay claimed until
+    /// `:killservo` (or the daemon hits its idle timeout).
+    servo_client: servo_daemon::DaemonClient,
+    /// Engine tier picked at launch (`--js`/`-j`). When false, the
+    /// boa pipeline in `load_result` is skipped entirely — no script
+    /// extraction, no DOM-mutation surfacing, no JS-driven redirects
+    /// or cookie writes. Tier 3 (Servo) is orthogonal to this and
+    /// always available via `S` / `:servo`.
+    js_enabled: bool,
+    /// True when scroll was launched with a positional URL argument
+    /// (one-shot mode, no session restore, no save). Used to suppress
+    /// session-only chrome like the set chips — ephemeral runs are
+    /// usually embedder calls (kastrup x-key) that just want a clean
+    /// "render this URL" view.
+    ephemeral: bool,
     tabs: Vec<Tab>,
     current_tab: usize,
     /// Per-tab set membership — tab N is a member of set `tab_set[N]`.
@@ -80,6 +107,59 @@ struct App {
 }
 
 fn main() {
+    // Three engine tiers, picked at launch:
+    //   default            → tier 1: no JS at all. Pure HTML→text.
+    //                        Same speed as pre-boa scroll. Use this
+    //                        for embedders (kastrup), simple browsing,
+    //                        anything where the page works without JS.
+    //   --js / -j          → tier 2: boa engine. Inline scripts run,
+    //                        cookies / RSC / `window.location` redirects
+    //                        get handled. Right for "lightly JS-driven
+    //                        pages that aren't full SPAs."
+    //   --servo / -s       → tier 3: full Servo via the daemon. Cold-
+    //                        launches into a Servo render of the URL.
+    //                        `S` mid-session works in any tier.
+    //
+    // Plus the original two modes:
+    //   `scroll`           → restore all sets + tabs from session.json
+    //   `scroll <url>`     → ephemeral one-shot, one tab, no save
+    let mut js_enabled = false;
+    let mut servo_at_start = false;
+    let mut argv_url: Option<String> = None;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--js" | "-j" => js_enabled = true,
+            "--servo" | "-s" => servo_at_start = true,
+            "--help" | "-h" => {
+                println!("scroll — terminal browser, three engine tiers");
+                println!();
+                println!("USAGE:");
+                println!("  scroll [FLAGS] [URL]");
+                println!();
+                println!("FLAGS:");
+                println!("  -j, --js       Enable the boa JS engine (tier 2). Off by default.");
+                println!("  -s, --servo    Cold-launch into the Servo daemon (tier 3) on URL.");
+                println!("  -h, --help     This help.");
+                println!();
+                println!("With no URL, scroll restores ~/.scroll/session.json.");
+                println!("With a URL, scroll opens a single ephemeral tab.");
+                println!();
+                println!("Mid-session: `j` toggle is not provided (per-launch only),");
+                println!("but `S` always renders the current tab through Servo regardless.");
+                std::process::exit(0);
+            }
+            other if other.starts_with('-') => {
+                eprintln!("scroll: unknown flag {other:?} (try --help)");
+                std::process::exit(2);
+            }
+            other => {
+                if argv_url.is_none() { argv_url = Some(other.to_string()); }
+            }
+        }
+    }
+    let ephemeral = argv_url.is_some();
+    let initial_url = argv_url.clone().unwrap_or_else(|| "about:home".into());
+
     // Refuse to run without a real TTY. crossterm's event::poll on a
     // non-tty can return Err immediately, which our main loop turns
     // into a tight None-then-continue spin at 100% CPU. Detect at
@@ -91,16 +171,6 @@ fn main() {
         std::process::exit(2);
     }
     config::ensure_dirs();
-
-    // Two invocation modes:
-    //   `scroll`              → restore all sets and tabs from disk
-    //                            (`~/.scroll/session.json`).
-    //   `scroll <url>`        → ephemeral one-shot: a single tab in
-    //                            the default set, no session
-    //                            restore, no session save on exit.
-    let argv_url = std::env::args().nth(1);
-    let ephemeral = argv_url.is_some();
-    let initial_url = argv_url.clone().unwrap_or_else(|| "about:home".into());
 
     Crust::init();
     Crust::set_app_identity("Scroll");
@@ -128,6 +198,9 @@ fn main() {
         rows,
         conf,
         fetcher: Fetcher::new_with_set(&initial_set),
+        servo_client: servo_daemon::DaemonClient::new(),
+        js_enabled,
+        ephemeral,
         tabs: Vec::new(),
         current_tab: 0,
         tab_set: Vec::new(),
@@ -168,7 +241,23 @@ fn main() {
         // Single-shot: one tab, no session restore.
         app.tabs.push(Tab::new("about:blank"));
         app.tab_set.push(app.current_set);
+        if servo_at_start {
+            // `--servo URL`: fire :S on the URL right after fetch, so
+            // the user lands directly on the Servo render. Same code
+            // path as pressing S, just done automatically.
+            app.navigate(&initial_url);
+            app.servo_render_cmd("");
+        } else {
+            app.navigate(&initial_url);
+        }
+    } else if servo_at_start {
+        // `scroll --servo` with no URL: rare, but treat it as "open
+        // homepage in Servo." Otherwise users would have to type
+        // an URL first then press S.
+        app.tabs.push(Tab::new("about:blank"));
+        app.tab_set.push(app.current_set);
         app.navigate(&initial_url);
+        app.servo_render_cmd("");
     } else if let Some(session) = config::load_session() {
         // Restore tabs and sets from prior run. Each restored tab
         // gets its target URL but only the active tab is fetched
@@ -261,6 +350,7 @@ fn main() {
             "H" | "BACK" | "C-DOWN" => { app.go_back(); }
             "L" | "DEL" | "C-UP" => { app.go_forward(); }
             "r" => { app.reload(); }
+            "S" => { app.servo_render_cmd(""); }
 
             // Links & forms
             "TAB" => { app.focus_next(); }
@@ -335,7 +425,40 @@ fn main() {
         });
     }
 
+    // If we're the LAST scroll instance, ask the Servo daemon to
+    // shut down so its ~150 MB RSS doesn't linger after the user
+    // closed their last scroll window. If other scrolls are still
+    // running they may still want the daemon — leave it alone in
+    // that case (its own idle timeout takes care of it eventually).
+    if app.servo_client.is_running() && count_scroll_processes() <= 1 {
+        let _ = app.servo_client.shutdown();
+    }
+
     Crust::cleanup();
+}
+
+/// Count live scroll processes by walking /proc/*/comm. Used at exit
+/// to decide whether to also shut down the Servo daemon (only when
+/// we're the last one). Returns 0 if /proc isn't readable.
+fn count_scroll_processes() -> usize {
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name.bytes().all(|b| b.is_ascii_digit()) { continue; }
+        let comm_path = format!("/proc/{}/comm", name);
+        if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+            if comm.trim() == "scroll" { count += 1; }
+        }
+    }
+    count
 }
 
 impl App {
@@ -377,19 +500,27 @@ impl App {
         // forced the user to mentally subtract.
         let in_set = self.tabs_in_current_set();
         let count_in_set = in_set.len();
-        let mut chips: Vec<String> = Vec::new();
-        for (i, name) in self.sets.iter().enumerate() {
-            let count = self.tab_set.iter().filter(|&&s| s == i).count();
-            let color = self.set_color(i);
-            let label = format!("{}: {}", name, count);
-            let chip = if i == self.current_set {
-                style::bold(&style::fg(&format!(" [{}] ", label), color))
-            } else {
-                style::fg(&format!(" {} ", label), color)
-            };
-            chips.push(chip);
-        }
-        let chip_block = chips.join("");
+        // Ephemeral mode (scroll launched with a positional URL) is
+        // the kastrup-embed / "render this one page" path. Sets are
+        // session-mode chrome — suppress them entirely so the tab bar
+        // is clean.
+        let chip_block = if self.ephemeral {
+            String::new()
+        } else {
+            let mut chips: Vec<String> = Vec::new();
+            for (i, name) in self.sets.iter().enumerate() {
+                let count = self.tab_set.iter().filter(|&&s| s == i).count();
+                let color = self.set_color(i);
+                let label = format!("{}: {}", name, count);
+                let chip = if i == self.current_set {
+                    style::bold(&style::fg(&format!(" [{}] ", label), color))
+                } else {
+                    style::fg(&format!(" {} ", label), color)
+                };
+                chips.push(chip);
+            }
+            chips.join("")
+        };
         if count_in_set <= 1 {
             self.tab_bar.say(&chip_block);
             return;
@@ -401,16 +532,77 @@ impl App {
             } else {
                 t.title.chars().take(20).collect::<String>()
             };
+            // Distinguish Servo-rendered tabs visually so the user
+            // knows which engine is driving the page. A leading ◆ in
+            // a magenta accent is small, easy to spot, and survives
+            // truncation since it's the first glyph.
+            let marker = if t.servo_rendered {
+                style::fg("\u{25C6} ", 201)
+            } else {
+                String::new()
+            };
             if i == self.current_tab {
                 // Active tab: bold white — pops against the colored
                 // set chips and any inactive tabs.
-                style::bold(&style::fg(&format!(" {} ", label), 255))
+                let body = style::bold(&style::fg(&format!(" {} ", label), 255));
+                format!("{}{}", marker, body)
             } else {
                 // Inactive tabs: dim gray.
-                style::fg(&format!(" {} ", label), 244)
+                let body = style::fg(&format!(" {} ", label), 244);
+                format!("{}{}", marker, body)
             }
         }).collect();
-        self.tab_bar.say(&format!("{}  {}", chip_block, parts.join("\u{2502}")));
+
+        // Pane width budget after the set-chip block + 2-col gap.
+        let pane_w = self.tab_bar.w as usize;
+        let chip_w = crust::display_width(&chip_block);
+        let gap = 2;
+        let avail = pane_w.saturating_sub(chip_w + gap);
+        let widths: Vec<usize> = parts.iter().map(|p| crust::display_width(p)).collect();
+        let n = parts.len();
+        let sep_w = 1; // "│"
+        let total: usize = widths.iter().sum::<usize>() + sep_w * n.saturating_sub(1);
+
+        if total <= avail {
+            self.tab_bar.say(&format!("{}  {}", chip_block, parts.join("\u{2502}")));
+            return;
+        }
+
+        // Need to slide the window so the active tab stays visible.
+        // Reserve 2 cols on each side for the ◀ / ▶ markers (we may
+        // claim only the side that's actually clipping, but reserving
+        // both upfront keeps the math simple).
+        let active_idx = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
+        let reserve = 4;
+        let inner_avail = avail.saturating_sub(reserve);
+
+        let mut start = active_idx;
+        let mut end = active_idx + 1;
+        let mut used = widths[active_idx].min(inner_avail);
+        loop {
+            let mut grew = false;
+            if end < n {
+                let need = sep_w + widths[end];
+                if used + need <= inner_avail { used += need; end += 1; grew = true; }
+            }
+            if start > 0 {
+                let need = sep_w + widths[start - 1];
+                if used + need <= inner_avail { used += need; start -= 1; grew = true; }
+            }
+            if !grew { break; }
+        }
+
+        let marker_color = self.conf.c_info_fg as u8;
+        let prefix = if start > 0 { format!("{} ", style::fg("\u{25C0}", marker_color)) } else { String::new() };
+        let suffix = if end < n { format!(" {}", style::fg("\u{25B6}", marker_color)) } else { String::new() };
+
+        self.tab_bar.say(&format!(
+            "{}  {}{}{}",
+            chip_block,
+            prefix,
+            parts[start..end].join("\u{2502}"),
+            suffix
+        ));
     }
 
     fn render_main(&mut self) {
@@ -463,33 +655,54 @@ impl App {
             state.ready.clear();
         }
 
-        // Spawn background thread to download all images
+        // Spawn background thread to download all images. Each thread
+        // gets its own tokio runtime + rquest client; both are cheap
+        // to construct and the thread is short-lived (one batch). The
+        // Firefox emulation here matters for CDNs that gate on JA3
+        // (github avatars, dualog assets, anything cf-fronted).
         let state = self.img_state.clone();
         self.img_thread = Some(std::thread::spawn(move || {
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(10))
-                .timeout_read(std::time::Duration::from_secs(10))
-                .redirects(10)
-                .build();
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            let client = match rquest::Client::builder()
+                .emulation(rquest_util::Emulation::Firefox136)
+                .timeout(std::time::Duration::from_secs(10))
+                .redirect(rquest::redirect::Policy::limited(10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
 
-            for (url, cache_path) in &pending {
-                if std::path::Path::new(cache_path).exists() { continue; }
-                let resp = agent.get(url)
-                    .set("User-Agent", "scroll/0.1")
-                    .call();
-                if let Ok(resp) = resp {
-                    let ct = resp.content_type().to_string();
+            runtime.block_on(async {
+                for (url, cache_path) in &pending {
+                    if std::path::Path::new(cache_path).exists() { continue; }
+                    let resp = match client.get(url).send().await {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    let ct = resp.headers()
+                        .get(rquest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
                     // oEmbed: JSON response containing thumbnail_url
                     if ct.contains("json") && url.contains("oembed") {
-                        if let Ok(body) = resp.into_string() {
+                        if let Ok(body) = resp.text().await {
                             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
                                 if let Some(thumb) = json["thumbnail_url"].as_str() {
-                                    if let Ok(tr) = agent.get(thumb).call() {
-                                        let mut bytes = Vec::new();
-                                        if std::io::Read::read_to_end(&mut tr.into_reader(), &mut bytes).is_ok() && !bytes.is_empty() {
-                                            let _ = std::fs::write(cache_path, &bytes);
-                                            let mut s = state.lock().unwrap();
-                                            s.ready.push(cache_path.clone());
+                                    if let Ok(tr) = client.get(thumb).send().await {
+                                        if let Ok(bytes) = tr.bytes().await {
+                                            if !bytes.is_empty() {
+                                                let _ = std::fs::write(cache_path, &bytes);
+                                                let mut s = state.lock().unwrap();
+                                                s.ready.push(cache_path.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -497,14 +710,15 @@ impl App {
                         }
                         continue;
                     }
-                    let mut bytes = Vec::new();
-                    if std::io::Read::read_to_end(&mut resp.into_reader(), &mut bytes).is_ok() && !bytes.is_empty() {
-                        let _ = std::fs::write(cache_path, &bytes);
-                        let mut s = state.lock().unwrap();
-                        s.ready.push(cache_path.clone());
+                    if let Ok(bytes) = resp.bytes().await {
+                        if !bytes.is_empty() {
+                            let _ = std::fs::write(cache_path, &bytes);
+                            let mut s = state.lock().unwrap();
+                            s.ready.push(cache_path.clone());
+                        }
                     }
                 }
-            }
+            });
         }));
     }
 
@@ -767,80 +981,72 @@ impl App {
     }
 
     fn load_result(&mut self, result: fetcher::FetchResult) {
+        // Any fast-path load drops the tab out of "Servo rendered"
+        // state; the visual marker should disappear when the boa
+        // engine takes back over.
+        self.tab_mut().servo_rendered = false;
         let width = self.main.w as usize;
         if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
-            // Run inline <script> tags first so a JS-driven redirect
-            // (window.location.href = "...") gets honoured before the
-            // user sees the placeholder page. Capped at one hop per
-            // load to avoid infinite redirect loops.
-            // Snapshot the page-host cookies + load localStorage so
-            // JS sees a real document.cookie / localStorage. After
-            // execution, merge any JS-driven changes back.
-            let host = url::Url::parse(&result.url).ok()
-                .and_then(|u| u.host_str().map(|h| h.to_string()))
-                .unwrap_or_default();
-            let cookies_in = self.fetcher.cookies_for_host(&host);
-            let set_name = self.fetcher.active_set_name().to_string();
-            let ls_in = config::load_localstorage(&set_name, &host);
-            let js = js::run_scripts(&result.body, &result.url, cookies_in, ls_in);
-            if js.cookies_dirty && !host.is_empty() {
-                self.fetcher.replace_cookies_for_host(&host, js.cookies);
-            }
-            if js.localstorage_dirty && !host.is_empty() {
-                config::save_localstorage(&set_name, &host, &js.localstorage);
-            }
-            // Hand JS-set field values to the form-fill path via the
-            // tab — so a hidden input populated by inline JS rides
-            // along on submit.
-            if !js.dom_values.is_empty() {
-                self.tab_mut().js_dom_values = js.dom_values.clone();
-            }
-            // Stash the captured console output and the extracted
-            // script bodies on the tab. The submit-time re-run uses
-            // the scripts (without re-fetching externals); :jslog
-            // surfaces the log for debugging.
-            self.tab_mut().js_log = js.log.clone();
-            self.tab_mut().js_scripts = js.scripts.clone();
-            self.tab_mut().raw_html = result.body.clone();
+            let effective_html = if self.js_enabled {
+                // Tier 2: boa engine on inline scripts. Cookies / RSC /
+                // window.location redirects all flow through here.
+                let host = url::Url::parse(&result.url).ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_default();
+                let cookies_in = self.fetcher.cookies_for_host(&host);
+                let set_name = self.fetcher.active_set_name().to_string();
+                let ls_in = config::load_localstorage(&set_name, &host);
+                let js = js::run_scripts(&result.body, &result.url, cookies_in, ls_in);
+                if js.cookies_dirty && !host.is_empty() {
+                    self.fetcher.replace_cookies_for_host(&host, js.cookies);
+                }
+                if js.localstorage_dirty && !host.is_empty() {
+                    config::save_localstorage(&set_name, &host, &js.localstorage);
+                }
+                if !js.dom_values.is_empty() {
+                    self.tab_mut().js_dom_values = js.dom_values.clone();
+                }
+                self.tab_mut().js_log = js.log.clone();
+                self.tab_mut().js_scripts = js.scripts.clone();
+                self.tab_mut().raw_html = result.body.clone();
 
-            // ----- JS-driven content surfacing -----
-            // (A) innerHTML mutations: surgically replace each
-            //     element's content in the raw HTML and re-render.
-            //     Catches simple SPAs that do
-            //         document.getElementById("root").innerHTML = ...
-            // (B) Next.js / React Flight RSC payload: append the
-            //     extracted server-rendered text below the existing
-            //     page so a "Loading..." placeholder isn't the only
-            //     thing the user sees on a Next page.
-            let mut effective_html = result.body.clone();
-            if !js.inner_html_changes.is_empty() {
-                effective_html = apply_inner_html_changes(&effective_html, &js.inner_html_changes);
-            }
-            if let Some(target) = js.redirect {
-                if !target.is_empty() && target != result.url {
-                    let resolved = renderer::resolve_url(&result.url, &target);
-                    self.status.say(&format!(" JS redirect → {}", &resolved));
-                    self.navigate(&resolved);
-                    return;
+                let mut effective = result.body.clone();
+                if !js.inner_html_changes.is_empty() {
+                    effective = apply_inner_html_changes(&effective, &js.inner_html_changes);
                 }
-            }
-            // Append RSC-extracted text as a synthetic appended block.
-            // Wrapped in a <div> so the renderer treats it as a normal
-            // text run; preceded by an <hr> so the user sees it's a
-            // distinct "JS content" section.
-            if let Some(rsc) = &js.rsc_text {
-                let safe = rsc.replace('<', "&lt;").replace('>', "&gt;");
-                let block = format!(
-                    "<hr><div data-scroll-source=\"react-flight\"><pre>{}</pre></div>",
-                    safe,
-                );
-                // Insert just before </body> if present, else append.
-                if let Some(idx) = effective_html.to_ascii_lowercase().rfind("</body>") {
-                    effective_html.insert_str(idx, &block);
-                } else {
-                    effective_html.push_str(&block);
+                if let Some(target) = js.redirect {
+                    if !target.is_empty() && target != result.url {
+                        let resolved = renderer::resolve_url(&result.url, &target);
+                        self.status.say(&format!(" JS redirect → {}", &resolved));
+                        self.navigate(&resolved);
+                        return;
+                    }
                 }
-            }
+                if let Some(rsc) = &js.rsc_text {
+                    let safe = rsc.replace('<', "&lt;").replace('>', "&gt;");
+                    let block = format!(
+                        "<hr><div data-scroll-source=\"react-flight\"><pre>{}</pre></div>",
+                        safe,
+                    );
+                    if let Some(idx) = effective.to_ascii_lowercase().rfind("</body>") {
+                        effective.insert_str(idx, &block);
+                    } else {
+                        effective.push_str(&block);
+                    }
+                }
+                effective
+            } else {
+                // Tier 1: no JS at all. Pure HTML rendering. This is
+                // the kastrup-embedder path and the default invocation.
+                // Stash the raw HTML so :servo / S can still hand it
+                // to Servo if the user wants tier 3 mid-session.
+                self.tab_mut().raw_html = result.body.clone();
+                self.tab_mut().js_log.clear();
+                self.tab_mut().js_scripts.clear();
+                self.tab_mut().js_dom_values.clear();
+                result.body.clone()
+            };
+
             let rendered = renderer::render_html(&effective_html, width, &result.url, &self.conf);
             self.tab_mut().content = rendered.text;
             self.tab_mut().title = rendered.title;
@@ -1012,25 +1218,33 @@ impl App {
             self.running = false;
             return;
         }
-        let closed = self.tabs.remove(self.current_tab);
-        let closed_set = self.tab_set.remove(self.current_tab);
+        // Decide who to land on BEFORE removing — prefer the tab
+        // immediately to the left within the same set; if the closed
+        // tab was the leftmost, take the one to its right instead.
+        // This matches Firefox/Chrome muscle memory.
+        let in_set = self.tabs_in_current_set();
+        let pos = in_set.iter().position(|&i| i == self.current_tab).unwrap_or(0);
+        let target_pre_removal: Option<usize> = if in_set.len() > 1 {
+            if pos > 0 { Some(in_set[pos - 1]) } else { Some(in_set[1]) }
+        } else {
+            None
+        };
+
+        let removed_idx = self.current_tab;
+        let closed = self.tabs.remove(removed_idx);
+        let closed_set = self.tab_set.remove(removed_idx);
         self.closed_tabs.push(closed);
         self.closed_tab_sets.push(closed_set);
-        // Pick the next current_tab: prefer something in the current
-        // set; otherwise jump to whatever's around.
-        let in_set = self.tabs_in_current_set();
-        if let Some(&i) = in_set.first() {
-            self.current_tab = i;
+
+        if let Some(t) = target_pre_removal {
+            // Adjust the recorded index if the target lived after the
+            // removed tab in self.tabs (the vec shrunk by one).
+            self.current_tab = if t > removed_idx { t - 1 } else { t };
         } else if !self.tabs.is_empty() {
-            // No tabs left in current set — fall through to whatever
-            // index we landed on (clamped). User can switch sets to
-            // find their tabs.
-            if self.current_tab >= self.tabs.len() {
-                self.current_tab = self.tabs.len() - 1;
-            }
-            // Sync current_set to the new current_tab's set so the
-            // tab bar shows the right thing AND so the cookie jar
-            // follows the surviving tab's identity.
+            // Closed tab was alone in its set — fall through to a
+            // clamped index in another set, then sync the set so the
+            // cookie jar follows the surviving tab's identity.
+            self.current_tab = removed_idx.min(self.tabs.len() - 1);
             self.activate_set(self.tab_set[self.current_tab]);
         }
         self.render_all();
@@ -1191,6 +1405,14 @@ impl App {
         if q.is_empty() { return; }
         let target = self.sets.iter().position(|n| n.to_lowercase().starts_with(&q));
         if let Some(t) = target {
+            let source_idx = self.tab_set[self.current_tab];
+            if t != source_idx {
+                if let Some(host) = url::Url::parse(&self.tab().url).ok().and_then(|u| u.host_str().map(|s| s.to_string())) {
+                    let source_name = self.sets[source_idx].clone();
+                    let target_name = self.sets[t].clone();
+                    self.fetcher.move_cookies_for_host(&host, &source_name, &target_name);
+                }
+            }
             self.tab_set[self.current_tab] = t;
             self.activate_set(t);
             self.render_all();
@@ -1227,47 +1449,233 @@ impl App {
     // --- Focus / Links / Forms ---
 
     fn focus_next(&mut self) {
-        let n_links = self.tabs[self.current_tab].links.len();
-        if n_links == 0 { return; }
-        // Only cycle through links (not form fields for simplicity)
-        self.focus_index = ((self.focus_index + 1) as usize % n_links) as i32;
+        let items = self.focusables();
+        if items.is_empty() { return; }
+        self.focus_index = (((self.focus_index + 1) as usize) % items.len()) as i32;
         self.scroll_to_focused();
     }
 
     fn focus_prev(&mut self) {
-        let n_links = self.tabs[self.current_tab].links.len();
-        if n_links == 0 { return; }
-        self.focus_index = if self.focus_index <= 0 { n_links as i32 - 1 } else { self.focus_index - 1 };
+        let items = self.focusables();
+        if items.is_empty() { return; }
+        self.focus_index = if self.focus_index <= 0 {
+            items.len() as i32 - 1
+        } else {
+            self.focus_index - 1
+        };
         self.scroll_to_focused();
     }
 
+    /// Flat list of focusable items in document order: links + form
+    /// fields, sorted by line number. TAB / S-TAB walks this list;
+    /// ENTER dispatches on the kind. In Servo mode, ENTER routes
+    /// through the daemon (click for links, type for fields) so
+    /// framework JS handlers actually fire.
+    fn focusables(&self) -> Vec<FocusItem> {
+        let tab = &self.tabs[self.current_tab];
+        let mut items: Vec<(usize, FocusItem)> = Vec::new();
+        for (i, l) in tab.links.iter().enumerate() {
+            items.push((l.line, FocusItem::Link(i)));
+        }
+        for (fi, f) in tab.forms.iter().enumerate() {
+            for (gi, fld) in f.fields.iter().enumerate() {
+                // Skip hidden inputs — they shouldn't be TAB targets.
+                if fld.field_type == "hidden" { continue; }
+                items.push((fld.line, FocusItem::Field { form: fi, field: gi }));
+            }
+        }
+        items.sort_by_key(|(line, _)| *line);
+        items.into_iter().map(|(_, k)| k).collect()
+    }
+
     fn scroll_to_focused(&mut self) {
+        let items = self.focusables();
         let idx = self.focus_index as usize;
+        if idx >= items.len() { return; }
+        match items[idx] {
+            FocusItem::Link(li) => self.scroll_to_focused_link(li),
+            FocusItem::Field { form, field } => self.scroll_to_focused_field(form, field),
+        }
+    }
+
+    fn scroll_to_focused_link(&mut self, idx: usize) {
         let n_links = self.tabs[self.current_tab].links.len();
         if idx >= n_links { return; }
-
         let line = self.tabs[self.current_tab].links[idx].line;
         let link_idx = self.tabs[self.current_tab].links[idx].index;
         let link_text = self.tabs[self.current_tab].links[idx].text.clone();
         let href = self.tabs[self.current_tab].links[idx].href.clone();
-
-        // Highlight the focused link on the page
         let content = self.tabs[self.current_tab].content.clone();
         let links = self.tabs[self.current_tab].links.clone();
         let highlighted = renderer::highlight_link(&content, &links, idx);
-
         self.clear_images();
         self.tabs[self.current_tab].ix = line.saturating_sub(3);
         self.main.set_text(&highlighted);
         self.main.ix = self.tabs[self.current_tab].ix;
         self.main.full_refresh();
         if self.conf.show_images { self.show_visible_images(); }
-
-        // Show focused link info in status bar
-        self.status.say(&format!(" {} {} {}",
+        self.status.say(&format!(
+            " {} {} {}",
             style::fg(&format!("[{}]", link_idx), self.conf.c_link_num as u8),
             style::reverse(&link_text),
-            style::fg(&href, 245)));
+            style::fg(&href, 245)
+        ));
+    }
+
+    fn scroll_to_focused_field(&mut self, form_idx: usize, field_idx: usize) {
+        let tab = &self.tabs[self.current_tab];
+        let f = match tab.forms.get(form_idx).and_then(|f| f.fields.get(field_idx)) {
+            Some(x) => x.clone(),
+            None => return,
+        };
+        let line = f.line;
+        // No field highlight in the renderer yet — just scroll to the
+        // line and surface the field's identity in the status bar so
+        // the user knows what ENTER will edit.
+        self.clear_images();
+        self.tabs[self.current_tab].ix = line.saturating_sub(3);
+        self.main.ix = self.tabs[self.current_tab].ix;
+        self.main.full_refresh();
+        if self.conf.show_images { self.show_visible_images(); }
+        let label = if !f.id.is_empty() { format!("#{}", f.id) }
+                    else if !f.name.is_empty() { format!("[name={}]", f.name) }
+                    else { format!("({})", f.field_type) };
+        let typ = if f.field_type.is_empty() { "input".to_string() } else { f.field_type.clone() };
+        self.status.say(&format!(
+            " {} {} — Enter to edit",
+            style::fg(&format!("[{}]", typ), self.conf.c_link_num as u8),
+            style::reverse(&label)
+        ));
+    }
+
+    /// In Servo mode, ENTER on a focused link routes through the
+    /// daemon's `click` command so the page's JS handlers (React
+    /// onClick, framework-driven nav, etc.) actually fire. Falls
+    /// back to a plain navigate if no element matches.
+    fn servo_click_focused_link(&mut self, link_idx: usize) {
+        let href = match self.tabs[self.current_tab].links.get(link_idx) {
+            Some(l) => l.href.clone(),
+            None => return,
+        };
+        let resolved = renderer::resolve_url(&self.tab().url, &href);
+        let selector = format!("a[href=\"{}\"]", css_quote(&resolved));
+        self.status.say(&format!(" servo: clicking {}…", &resolved));
+        self.status.refresh();
+        match self.servo_client.click(&selector, &self.conf.user_agent) {
+            Ok(result) => {
+                if result.html.is_empty() {
+                    self.status.say(&style::fg(" servo: click returned empty document", 220));
+                    return;
+                }
+                self.replace_with_servo_html(&result.html, &result.url);
+                self.status.say(&format!(
+                    " servo: click {} → {}",
+                    style::fg(&href, 245),
+                    self.tab().url
+                ));
+            }
+            Err(e) => {
+                self.status.say(&style::fg(&format!(" servo: click failed: {e} — falling back to navigate"), 220));
+                self.navigate(&href);
+            }
+        }
+    }
+
+    /// ENTER on a focused field. Prompts for new text, then either
+    /// stashes the value in the tab's js_dom_values (fast-path mode,
+    /// so the next form-submit picks it up) or sends a `type` command
+    /// to the Servo daemon (Servo mode, so framework JS fires).
+    fn edit_focused_field(&mut self, form_idx: usize, field_idx: usize) {
+        let f = match self.tab().forms.get(form_idx).and_then(|f| f.fields.get(field_idx)) {
+            Some(x) => x.clone(),
+            None => return,
+        };
+        let label = if !f.id.is_empty() { format!("#{}", f.id) }
+                    else if !f.name.is_empty() { f.name.clone() }
+                    else { f.field_type.clone() };
+        let prompt = format!("{} = ", label);
+        let default = if !f.id.is_empty() {
+            self.tab().js_dom_values.get(&f.id).cloned().unwrap_or_else(|| f.value.clone())
+        } else {
+            f.value.clone()
+        };
+        let new_val = self.prompt(&prompt, &default);
+        if new_val.is_empty() { return; }
+
+        if self.tab().servo_rendered {
+            // Build a selector that matches the live DOM. Prefer #id
+            // (most specific), fall back to [name="..."]. Without a
+            // selector we can't target the field; bail with a hint.
+            let selector = if !f.id.is_empty() {
+                format!("#{}", css_quote_id(&f.id))
+            } else if !f.name.is_empty() {
+                format!("[name=\"{}\"]", css_quote(&f.name))
+            } else {
+                self.status.say(&style::fg(
+                    " servo: field has no id/name — can't address it via selector",
+                    220,
+                ));
+                return;
+            };
+            self.status.say(&format!(" servo: typing into {}…", &selector));
+            self.status.refresh();
+            match self.servo_client.type_into(&selector, &new_val, &self.conf.user_agent) {
+                Ok(result) => {
+                    if !result.html.is_empty() {
+                        self.replace_with_servo_html(&result.html, &self.tab().url.clone());
+                    }
+                    self.status.say(&format!(" servo: typed {} chars into {}", new_val.len(), &selector));
+                }
+                Err(e) => {
+                    self.status.say(&style::fg(&format!(" servo: type failed: {e}"), 196));
+                }
+            }
+        } else {
+            // Fast-path mode — stash the typed value in the per-tab
+            // override map; `f` (fill_form) consults this when
+            // building the POST body, so submit picks it up.
+            if !f.id.is_empty() {
+                self.tab_mut().js_dom_values.insert(f.id.clone(), new_val.clone());
+            }
+            // Also write into the form's field-list so a re-render
+            // shows the user the new value next to the field.
+            if let Some(form) = self.tabs[self.current_tab].forms.get_mut(form_idx) {
+                if let Some(field) = form.fields.get_mut(field_idx) {
+                    field.value = new_val.clone();
+                }
+            }
+            self.status.say(&format!(
+                " stashed {} chars for {} — press f to submit",
+                new_val.len(), label
+            ));
+        }
+    }
+
+    /// Re-render the current tab from a Servo-supplied HTML string.
+    /// Used by both `:servo` itself and post-click / post-type updates,
+    /// so the screen reflects the latest DOM after JS mutations.
+    fn replace_with_servo_html(&mut self, html: &str, url_hint: &str) {
+        let final_url = if url_hint.is_empty() { self.tab().url.clone() } else { url_hint.to_string() };
+        let width = self.main.w as usize;
+        let rendered = renderer::render_html(html, width, &final_url, &self.conf);
+        let title = if rendered.title.is_empty() {
+            format!("[servo] {}", final_url)
+        } else {
+            format!("[servo] {}", rendered.title)
+        };
+        let tab = self.tab_mut();
+        tab.url = final_url;
+        tab.title = title;
+        tab.content = rendered.text;
+        tab.links = rendered.links;
+        tab.forms = rendered.forms;
+        tab.images = rendered.images;
+        tab.site_bg = rendered.site_bg;
+        tab.site_fg = rendered.site_fg;
+        tab.servo_rendered = true;
+        self.focus_index = -1;
+        self.render_all();
+        self.start_image_downloads();
     }
 
     /// Open `href` in a freshly-spawned tab parked in the current set,
@@ -1288,12 +1696,24 @@ impl App {
     /// the original semantics (current tab).
     fn follow_focused(&mut self) {
         if self.focus_index >= 0 {
+            let items = self.focusables();
             let idx = self.focus_index as usize;
-            let n_links = self.tabs[self.current_tab].links.len();
-            if idx < n_links {
-                let href = self.tabs[self.current_tab].links[idx].href.clone();
-                self.navigate(&href);
-                return;
+            if idx < items.len() {
+                match items[idx] {
+                    FocusItem::Link(li) => {
+                        if self.tab().servo_rendered {
+                            self.servo_click_focused_link(li);
+                        } else {
+                            let href = self.tabs[self.current_tab].links[li].href.clone();
+                            self.navigate(&href);
+                        }
+                        return;
+                    }
+                    FocusItem::Field { form, field } => {
+                        self.edit_focused_field(form, field);
+                        return;
+                    }
+                }
             }
         }
         // Prompt for link number; trailing 't' = tab-open
@@ -1767,6 +2187,12 @@ impl App {
             "   H / Backspace / C-↓   back in history".into(),
             "   L / Delete / C-↑      forward in history".into(),
             "   r                  reload".into(),
+            "   S                  re-render via Servo daemon (full SPA support)".into(),
+            String::new(),
+            format!(" {}", h("Engine tier (per-launch)")),
+            "   default            tier 1: no JS at all (kastrup uses this)".into(),
+            "   scroll --js / -j   tier 2: boa engine for inline scripts".into(),
+            "   scroll --servo /-s tier 3: cold-launch into Servo on the URL".into(),
             String::new(),
             format!(" {}", h("Links & forms")),
             "   Tab / S-Tab        focus next / prev link or field".into(),
@@ -1806,6 +2232,8 @@ impl App {
             "   :ffimport          re-import cookies from current set's FF profile".into(),
             "   :browse / :ff      open current URL in Firefox (uses set's profile)".into(),
             "   :jslog             show captured console output for this page".into(),
+            "   :servo [url] / :S  render through Servo daemon (full SPA support)".into(),
+            "   :killservo         stop Servo daemon, reclaim memory".into(),
             String::new(),
             style::fg(" j/k or ↓/↑ scroll · ESC / q / ? close", 245),
         ];
@@ -1964,6 +2392,8 @@ impl App {
             "ffimport" => { self.ffimport_cmd(); }
             "browse" | "ff" => { self.browse_in_firefox(); }
             "jslog" => { self.show_jslog(); }
+            "servo" | "S" => { self.servo_render_cmd(args); }
+            "killservo" => { self.killservo_cmd(); }
             _ => { self.status.say(&style::fg(&format!(" Unknown command: {}", command), 196)); }
         }
     }
@@ -2083,23 +2513,136 @@ impl App {
     /// `:ffimport` — refresh the active jar from the configured
     /// Firefox profile right now, without waiting for the next set
     /// switch. Useful after logging in to a site in Firefox.
+    /// `:servo [url]` (alias `:S`) — render `url` (or the current tab's
+    /// URL) through the long-running Servo daemon. First call spawns
+    /// the daemon, subsequent calls reuse the connection (and Servo's
+    /// JS / DOM state). Use `:killservo` to reclaim memory.
+    fn servo_render_cmd(&mut self, args: &str) {
+        let target = if args.is_empty() { self.tab().url.clone() } else { args.to_string() };
+        if target.is_empty() || target == "about:blank" {
+            self.status.say(&style::fg(" :servo needs a URL (open one first or pass it explicitly)", 220));
+            return;
+        }
+        self.status.say(&format!(" servo: rendering {}…", target));
+        self.status.refresh();
+
+        // Install cookies for the target host first so the navigate
+        // request carries auth from the start. The daemon caches the
+        // jar inside Servo's SiteDataManager; subsequent navigates to
+        // the same host reuse the same cookies (until :killservo).
+        let set_name = self.fetcher.active_set_name().to_string();
+        let jar_path = config::cookie_jar_path(&set_name);
+        if jar_path.exists() {
+            match self.servo_client.install_cookies(&jar_path, &target, &self.conf.user_agent) {
+                Ok(_n) => {} // success — silent
+                Err(e) => {
+                    self.status.say(&style::fg(&format!(" servo: cookie install failed: {e}"), 220));
+                }
+            }
+        }
+
+        let nav = self.servo_client.navigate(&target, &self.conf.user_agent);
+        match nav {
+            Ok(result) => {
+                let html = result.html;
+                if html.is_empty() {
+                    self.status.say(&style::fg(
+                        " servo: 0 bytes (page paints to closed shadow DOM, or load wedged)",
+                        220,
+                    ));
+                    return;
+                }
+                let bytes = html.len();
+                let final_url = if result.url.is_empty() { target.clone() } else { result.url.clone() };
+                let width = self.main.w as usize;
+                let rendered = renderer::render_html(&html, width, &final_url, &self.conf);
+                let title = if rendered.title.is_empty() {
+                    format!("[servo] {}", final_url)
+                } else {
+                    format!("[servo] {}", rendered.title)
+                };
+                let tab = self.tab_mut();
+                tab.url = final_url.clone();
+                tab.title = title;
+                tab.content = rendered.text;
+                tab.links = rendered.links;
+                tab.forms = rendered.forms;
+                tab.images = rendered.images;
+                tab.site_bg = rendered.site_bg;
+                tab.site_fg = rendered.site_fg;
+                tab.servo_rendered = true;
+                tab.ix = 0;
+                self.main.ix = 0;
+                self.focus_index = -1;
+                self.render_all();
+                self.start_image_downloads();
+                let redirect_note = if final_url != target {
+                    format!("  (redirected: {} → {})", target, &final_url)
+                } else {
+                    String::new()
+                };
+                let timeout_note = if result.timed_out { "  [PARTIAL: timed out]" } else { "" };
+                self.status.say(&format!(
+                    " servo: {} bytes → {} links, {} forms, {} images{}{}",
+                    bytes,
+                    self.tab().links.len(),
+                    self.tab().forms.len(),
+                    self.tab().images.len(),
+                    timeout_note,
+                    redirect_note,
+                ));
+            }
+            Err(e) => {
+                self.status.say(&style::fg(&format!(" servo: {}", e), 196));
+            }
+        }
+    }
+
+    /// `:killservo` — tell the daemon to shut down and reclaim memory.
+    /// The next `:servo` call will spawn a fresh one. Also clears the
+    /// `servo_rendered` marker on every tab — the rendered text stays
+    /// (it's just text), but the magenta indicator stops claiming
+    /// "live Servo state" once the daemon is gone.
+    fn killservo_cmd(&mut self) {
+        if !self.servo_client.is_running() {
+            // Even if the daemon is already gone, sweep stale markers.
+            let cleared = self.tabs.iter().filter(|t| t.servo_rendered).count();
+            for t in self.tabs.iter_mut() { t.servo_rendered = false; }
+            if cleared > 0 {
+                self.render_tabs();
+                self.status.say(&format!(" servo: daemon not running ({} stale markers cleared)", cleared));
+            } else {
+                self.status.say(" servo: daemon not running");
+            }
+            return;
+        }
+        match self.servo_client.shutdown() {
+            Ok(_) => {
+                let cleared = self.tabs.iter().filter(|t| t.servo_rendered).count();
+                for t in self.tabs.iter_mut() { t.servo_rendered = false; }
+                self.render_tabs();
+                self.status.say(&style::fg(
+                    &format!(" servo: daemon stopped, {cleared} markers cleared, memory reclaimed"),
+                    82,
+                ));
+            }
+            Err(e) => self.status.say(&style::fg(&format!(" servo: shutdown failed: {e}"), 196)),
+        }
+    }
+
     fn ffimport_cmd(&mut self) {
         let set_name = self.sets.get(self.current_set).cloned().unwrap_or_default();
-        let profile = match self.conf.firefox_profiles.get(&set_name).cloned() {
-            Some(p) if !p.is_empty() => p,
-            _ => {
-                self.status.say(&style::fg(
-                    &format!(" No firefox_profiles entry for set \"{}\" — set one in ~/.scroll/config.json",
-                        set_name),
-                    220,
-                ));
-                return;
-            }
-        };
+        // Fall back to the system default FF profile when no mapping
+        // exists. Most users only have one profile, and after the set
+        // rename refactor a per-set mapping has to be re-created
+        // anyway — so silently using the default is far less annoying
+        // than failing with "set one in config.json".
+        let profile = self.conf.firefox_profiles.get(&set_name).cloned().unwrap_or_default();
+        let label = if profile.is_empty() { "<default>".to_string() } else { profile.clone() };
         match self.fetcher.import_firefox_cookies(&profile) {
-            Some(n) => self.status.say(&format!(" Imported {} cookies from FF profile \"{}\"", n, profile)),
+            Some(n) => self.status.say(&format!(" Imported {} cookies from FF profile \"{}\"", n, label)),
             None => self.status.say(&style::fg(
-                &format!(" FF import failed: profile \"{}\" not found or db locked", profile),
+                &format!(" FF import failed: profile \"{}\" not found or db locked", label),
                 196,
             )),
         }
@@ -2344,6 +2887,38 @@ fn load_adblock() -> HashSet<String> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(|l| l.trim().to_string())
         .collect()
+}
+
+/// Escape a string so it's safe inside a CSS attribute selector
+/// `"…"`. Just `\` and `"` need quoting. Used to build
+/// `a[href="…"]` and `[name="…"]` selectors.
+fn css_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '"' => { out.push('\\'); out.push(c); }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a string so it's safe as a CSS id selector after `#`.
+/// Per CSSOM Level 1, anything outside `[A-Za-z0-9-_]` plus the
+/// non-ASCII range needs `\` prefixing. Conservative version that
+/// just escapes the punctuation classes most commonly seen in
+/// framework-generated ids (colons, dots, slashes, brackets, etc.).
+fn css_quote_id(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('\\');
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn img_cache_path(src: &str) -> String {
