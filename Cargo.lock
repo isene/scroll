@@ -1881,12 +1881,13 @@ dependencies = [
 
 [[package]]
 name = "scroll"
-version = "0.3.0"
+version = "0.3.2"
 dependencies = [
  "boa_engine",
  "fe2o3-crust",
  "fe2o3-glow",
  "libc",
+ "regex",
  "rquest",
  "rquest-util",
  "rusqlite",

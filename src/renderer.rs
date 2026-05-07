@@ -13,6 +13,19 @@ fn sel_option() -> &'static scraper::Selector { static S: OnceLock<scraper::Sele
 fn sel_tr() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("tr").unwrap()) }
 fn sel_td_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("td, th").unwrap()) }
 fn sel_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("th").unwrap()) }
+
+/// Regex for "elements rendered invisible by CSS." Single-level only
+/// (the body uses `[^<]` so nested tags don't accidentally match).
+/// Rust's regex crate has no backreferences, so we close-tag with the
+/// same alternation set instead of pinning to the open-tag's name.
+fn hidden_element_re() -> &'static regex::Regex {
+    static R: OnceLock<regex::Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?is)<(?:div|span|p|td|tr|table|section)\b[^>]*\bstyle\s*=\s*"[^"]*\b(?:display\s*:\s*none|visibility\s*:\s*hidden|opacity\s*:\s*0(?:\.0+)?|max-height\s*:\s*0(?:px)?|max-width\s*:\s*0(?:px)?)[^"]*"[^>]*>[^<]*</\s*(?:div|span|p|td|tr|table|section)\s*>"#
+        ).expect("hidden-element regex must compile")
+    })
+}
 fn sel_style() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("style").unwrap()) }
 
 pub struct RenderResult {
@@ -89,7 +102,18 @@ pub fn highlight_link(content: &str, links: &[Link], focus_idx: usize) -> String
 }
 
 pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::config::Config) -> RenderResult {
-    let doc = Html::parse_document(html);
+    // Strip CSS-hidden elements before parsing. Newsletter HTML
+    // (Substack, TLDR, GitHub digest, etc.) ships an inbox-preview
+    // blob hidden via `display:none` / `max-height:0` / `opacity:0`
+    // — the same content as the first headline, padded with
+    // soft-hyphens and ZWNBSPs. Without this strip the user sees
+    // both the preview AND the body, producing visible duplication.
+    // Same regex shape kastrup uses in `html_to_text`. Single-level:
+    // matches a `<div|span|p|td|tr|table|section>` whose style
+    // contains the offending property and whose body has no nested
+    // tags (so we don't accidentally swallow real content).
+    let stripped = hidden_element_re().replace_all(html, "");
+    let doc = Html::parse_document(&stripped);
     let mut ctx = RenderContext {
         lines: Vec::new(),
         current_line: String::new(),
@@ -426,9 +450,20 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             ctx.newline();
         }
         "table" => {
-            ctx.ensure_blank_line();
-            render_table(el, ctx);
-            ctx.ensure_blank_line();
+            // Heuristic: real data tables have at least one `<th>`.
+            // Anything else is a layout table (very common in email
+            // HTML) — boxed rendering would flatten its anchors and
+            // nested newsletter tables blow up exponentially under
+            // descendant selectors. For layout tables, fall through
+            // to plain element traversal so walk_element visits each
+            // descendant exactly once.
+            if el.select(sel_th()).next().is_some() {
+                ctx.ensure_blank_line();
+                render_table(el, ctx);
+                ctx.ensure_blank_line();
+            } else {
+                walk_element(el, ctx);
+            }
         }
         "iframe" => {
             let src = el.value().attr("src").unwrap_or("");
@@ -525,22 +560,11 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
-    // Heuristic: a real data table has at least one `<th>`. Tables
-    // without `<th>` are almost always *layout tables* — common in
-    // email HTML (GitHub invitations, newsletters, etc.) where the
-    // markup is `<table><tr><td><a href=...>` and the box-drawing
-    // rendering would flatten all the anchors to plain text. Walk the
-    // children inline instead so links and other elements survive.
-    let has_th = el.select(sel_th()).next().is_some();
-    if !has_th {
-        for row in el.select(sel_tr()) {
-            for cell in row.select(sel_td_th()) {
-                walk_element(&cell, ctx);
-            }
-        }
-        return;
-    }
-
+    // Caller guarantees a `<th>`-bearing data table. Layout tables
+    // (no `<th>`) are short-circuited in handle_element so they never
+    // hit this path — flattening their anchors to .text() would
+    // strip links and the descendant-selector walk would explode on
+    // nested-table HTML.
     let mut rows: Vec<Vec<String>> = Vec::new();
     for row in el.select(sel_tr()) {
         let cells: Vec<String> = row.select(sel_td_th())

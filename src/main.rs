@@ -307,7 +307,15 @@ fn main() {
         if app.g_pressed {
             app.g_pressed = false;
             match key.as_str() {
-                "g" => { app.main.ix = 0; app.render_main(); continue; }
+                "g" => {
+                    // gg → jump to top. Both indices must move
+                    // together (per CLAUDE.md HOME-key note) or the
+                    // tab's stored scroll desyncs from the pane.
+                    app.tabs[app.current_tab].ix = 0;
+                    app.main.ix = 0;
+                    app.render_main();
+                    continue;
+                }
                 // Tab-set admin under `g`. The cycling is on arrow keys.
                 "n" => { app.rename_set(); continue; }
                 "N" => { app.new_set(); continue; }

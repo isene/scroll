@@ -1,6 +1,6 @@
 [package]
 name = "scroll"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 authors = ["Geir Isene <g@isene.com>"]
 description = "Terminal web browser with vim keybindings. Feature clone of brrowser."
@@ -34,3 +34,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # fetch-based POSTs, and `window.location` redirects work inside
 # scroll. No native deps; ~5 MB compiled-in.
 boa_engine = "0.20"
+# Used to strip CSS-hidden elements (display:none / visibility:hidden /
+# opacity:0 / max-height:0 / max-width:0) from email HTML before
+# rendering — newsletters stuff "preview-text" into these so a Gmail
+# inbox listing can show a blurb. Without the strip, the preview text
+# gets rendered AS WELL AS the actual headline, producing duplicate
+# sections in the rendered output.
+regex = "1"
