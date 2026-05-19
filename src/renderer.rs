@@ -11,6 +11,8 @@ fn sel_body() -> &'static scraper::Selector { static S: OnceLock<scraper::Select
 fn sel_img() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("img").unwrap()) }
 fn sel_option() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("option").unwrap()) }
 fn sel_tr() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("tr").unwrap()) }
+/// Children-only selectors for nested-table heuristics and row pickup.
+fn sel_inner_table() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("table").unwrap()) }
 fn sel_td_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("td, th").unwrap()) }
 fn sel_th() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("th").unwrap()) }
 
@@ -362,12 +364,31 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             if src.is_empty() { return; }
             let alt = el.value().attr("alt").unwrap_or("image");
             let resolved = resolve_url(&ctx.base_url, src);
-            // Flush current line so image reserve starts on a fresh line
+            // Pick a reserve height proportional to the image's
+            // declared dimensions. Marketing emails / Outlook are
+            // *littered* with 1x1 trackers, 100x1 / 1x83 layout
+            // spacers, and small icons — reserving the default 10
+            // lines for each turns a 22-image message into 220 blank
+            // lines of dead space. Concretely:
+            //   - any dimension ≤ 5 → 0 lines  (tracker / spacer)
+            //   - either ≤ 30       → 1 line   (inline icon)
+            //   - else height known → ⌈height / 20⌉  capped at IMG_RESERVE
+            //   - else              → IMG_RESERVE  (content image)
+            let w = el.value().attr("width").and_then(|s| s.parse::<u32>().ok());
+            let h = el.value().attr("height").and_then(|s| s.parse::<u32>().ok());
+            let small = w.map(|x| x <= 5).unwrap_or(false)
+                     || h.map(|x| x <= 5).unwrap_or(false);
+            let inline_icon = w.map(|x| x <= 30).unwrap_or(false)
+                           || h.map(|x| x <= 30).unwrap_or(false);
+            let reserve = if small { 0 }
+                else if inline_icon { 1 }
+                else if let Some(hh) = h { ((hh as usize + 19) / 20).min(IMG_RESERVE).max(1) }
+                else { IMG_RESERVE };
+            if reserve == 0 { return; }
             if !ctx.current_line.is_empty() { ctx.newline(); }
             let line = ctx.lines.len();
-            ctx.images.push(ImageRef { src: resolved, alt: alt.to_string(), line, height: IMG_RESERVE });
-            for _ in 0..IMG_RESERVE { ctx.lines.push(String::new()); }
-            // Reset col so next text starts fresh after image
+            ctx.images.push(ImageRef { src: resolved, alt: alt.to_string(), line, height: reserve });
+            for _ in 0..reserve { ctx.lines.push(String::new()); }
             ctx.col = 0;
         }
         "form" => {
@@ -450,14 +471,17 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             ctx.newline();
         }
         "table" => {
-            // Heuristic: real data tables have at least one `<th>`.
-            // Anything else is a layout table (very common in email
-            // HTML) — boxed rendering would flatten its anchors and
-            // nested newsletter tables blow up exponentially under
-            // descendant selectors. For layout tables, fall through
-            // to plain element traversal so walk_element visits each
-            // descendant exactly once.
-            if el.select(sel_th()).next().is_some() {
+            // Heuristic: a real data table has `<th>` AND no nested
+            // `<table>`. Outlook / marketing email uses `<th>` inside
+            // layout tables for alignment, and those layouts are
+            // arbitrarily nested — descending into them with
+            // render_table's descendant `<tr>` selector duplicates
+            // every inner row at the outer level and rebuilds the
+            // entire body of the message N times. Fall through to
+            // walk_element for anything that looks like layout so
+            // each descendant is visited exactly once.
+            let has_nested_table = el.select(sel_inner_table()).next().is_some();
+            if !has_nested_table && el.select(sel_th()).next().is_some() {
                 ctx.ensure_blank_line();
                 render_table(el, ctx);
                 ctx.ensure_blank_line();
@@ -568,9 +592,25 @@ fn render_table(el: &ElementRef, ctx: &mut RenderContext) {
     let mut rows: Vec<Vec<String>> = Vec::new();
     for row in el.select(sel_tr()) {
         let cells: Vec<String> = row.select(sel_td_th())
-            .map(|c| c.text().collect::<String>().trim().to_string())
+            .map(|c| {
+                // `.text()` returns concatenated descendant text with
+                // the source HTML's literal whitespace + newlines
+                // preserved. Outlook / marketing HTML is pretty-
+                // printed, so a single `<td>` worth of text often
+                // contains many `\n` plus runs of indentation spaces.
+                // `.trim()` only strips leading/trailing — internal
+                // whitespace would survive and break the column
+                // widths in the box-drawn path AND emit "spaces-only
+                // lines" in the vertical-layout fallback. Collapse
+                // every internal whitespace run to a single space.
+                let raw: String = c.text().collect();
+                collapse_whitespace(&raw).trim().to_string()
+            })
             .collect();
-        if !cells.is_empty() { rows.push(cells); }
+        // Drop rows where every cell collapsed to empty — they'd
+        // otherwise emit a stray `ctx.newline()` in the vertical
+        // path below for nothing.
+        if cells.iter().any(|c| !c.is_empty()) { rows.push(cells); }
     }
     if rows.is_empty() { return; }
     let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
