@@ -74,7 +74,7 @@ struct App {
     tabs: Vec<Tab>,
     current_tab: usize,
     /// Per-tab set membership — tab N is a member of set `tab_set[N]`.
-    /// Default 3 sets: 0 = Personal, 1 = PassionFruits, 2 = Dualog.
+    /// Default 3 sets: 0 = Personal, 1 = Work, 2 = Project.
     /// Index into `sets` (the names list).
     tab_set: Vec<usize>,
     /// Named sets. Persisted to `~/.scroll/sets.json`.

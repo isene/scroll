@@ -162,9 +162,9 @@ pub struct Config {
     /// once via Firefox per profile; scroll inherits the cookies.
     /// Empty / missing entry = no import; jar stays scroll-managed.
     /// Examples:
-    ///   "Personal"      → "default"
-    ///   "Dualog"        → "scroll-dualog"
-    ///   "PassionFruits" → "/home/geir/.mozilla/firefox/abc.passionfruits"
+    ///   "Personal" → "default"
+    ///   "Work"     → "scroll-work"
+    ///   "ProjectX" → "/home/<user>/.mozilla/firefox/abc.projectx"
     #[serde(default)]
     pub firefox_profiles: HashMap<String, String>,
     /// User-Agent string used by the headless Servo helper (`:servo`).
@@ -208,11 +208,12 @@ fn default_h1() -> u16 { 220 }
 fn default_h2() -> u16 { 214 }
 fn default_h3() -> u16 { 208 }
 fn default_set_colors() -> Vec<u16> {
-    // Match the user's rsh dir_colors palette so set identity is
-    // consistent across shell + browser:
-    //   Personal       = 172 (orange,  MakeItSimple in ~/.rshrc)
-    //   PassionFruits  = 171 (magenta, PassionFruit in ~/.rshrc)
-    //   Dualog         =  72 (teal,    Dualog in ~/.rshrc)
+    // Default palette matches the rsh dir_colors convention so set
+    // identity is consistent across shell + browser. Override per
+    // user via the rcfile.
+    //   set 0 = 172 (orange)
+    //   set 1 = 171 (magenta)
+    //   set 2 =  72 (teal)
     // Trailing entries are extras for any user-added sets.
     vec![172, 171, 72, 220, 121, 217]
 }
@@ -292,15 +293,15 @@ fn sets_path() -> PathBuf {
     scroll_dir().join("sets.json")
 }
 
-/// Load named tab sets. Defaults to ["Personal", "PassionFruits",
-/// "Dualog"] on first run; the rcfile can be edited freely.
+/// Load named tab sets. Defaults to ["Personal", "Work", "Project"]
+/// on first run; the rcfile can be edited freely.
 pub fn load_sets() -> Vec<String> {
     if let Ok(s) = fs::read_to_string(sets_path()) {
         if let Ok(v) = serde_json::from_str::<Vec<String>>(&s) {
             if !v.is_empty() { return v; }
         }
     }
-    vec!["Personal".into(), "PassionFruits".into(), "Dualog".into()]
+    vec!["Personal".into(), "Work".into(), "Project".into()]
 }
 
 pub fn save_sets(sets: &[String]) {

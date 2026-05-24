@@ -1553,21 +1553,34 @@ mod dom_fetch_tests {
 }
 
 #[cfg(test)]
-mod live_passionfruits {
+mod live_spa {
     use super::*;
+    /// Target URL is read from the `SCROLL_TEST_URL` env var so tests
+    /// don't hardcode a specific site. Defaults to https://example.com
+    /// which exercises the basic fetch path but not the RSC / SPA
+    /// scripting features — set the env var to a real SPA to exercise
+    /// those. Both tests are `#[ignore]` so CI doesn't depend on the
+    /// network.
+    fn test_url() -> String {
+        std::env::var("SCROLL_TEST_URL").unwrap_or_else(|_| "https://example.com/".to_string())
+    }
+
     /// Full pipeline trace: fetch → js → injected HTML → renderer.
     /// Prints what the user actually sees. Run with:
-    ///   cargo test --release passionfruits_full -- --ignored --nocapture
+    ///   SCROLL_TEST_URL=https://example.com/ \
+    ///     cargo test --release spa_full -- --ignored --nocapture
     #[test]
     #[ignore]
-    fn passionfruits_full_pipeline() {
+    fn spa_full_pipeline() {
+        let url = test_url();
         let html = match make_http().and_then(|(rt, c)| {
-            rt.block_on(async { c.get("https://passionfruits.net/").send().await.ok()?.text().await.ok() })
+            let u = url.clone();
+            rt.block_on(async { c.get(&u).send().await.ok()?.text().await.ok() })
         }) {
             Some(s) => s,
             None => { eprintln!("network fail"); return; }
         };
-        let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
+        let r = run_scripts(&html, &url, Default::default(), Default::default());
         eprintln!("redirect = {:?}", r.redirect);
         eprintln!("inner_html_changes = {} entries", r.inner_html_changes.len());
         eprintln!("--- rsc_text -----------------------------");
@@ -1587,7 +1600,7 @@ mod live_passionfruits {
                 effective.push_str(&block);
             }
         }
-        let rendered = crate::renderer::render_html(&effective, 120, "https://passionfruits.net/", &crate::config::Config::default());
+        let rendered = crate::renderer::render_html(&effective, 120, &url, &crate::config::Config::default());
         eprintln!("--- rendered text (stripped) -------------");
         let stripped = crust::strip_ansi(&rendered.text);
         for (i, line) in stripped.lines().enumerate() {
@@ -1597,19 +1610,21 @@ mod live_passionfruits {
         eprintln!("------------------------------------------");
     }
 
-    /// Hits passionfruits.net live and reports what the RSC parser
+    /// Hits the SCROLL_TEST_URL live and reports what the RSC parser
     /// can pull out. Marked `ignore` so CI doesn't depend on the
-    /// network. Run with: `cargo test --release passionfruits -- --ignored --nocapture`
+    /// network. Run with: `cargo test --release dump_extracted -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn dump_extracted_text() {
+        let url = test_url();
         let html = match make_http().and_then(|(rt, c)| {
-            rt.block_on(async { c.get("https://passionfruits.net/").send().await.ok()?.text().await.ok() })
+            let u = url.clone();
+            rt.block_on(async { c.get(&u).send().await.ok()?.text().await.ok() })
         }) {
             Some(s) => s,
             None => { eprintln!("network fail"); return; }
         };
-        let r = run_scripts(&html, "https://passionfruits.net/", Default::default(), Default::default());
+        let r = run_scripts(&html, &url, Default::default(), Default::default());
         eprintln!("--- inner_html_changes ({}) ---", r.inner_html_changes.len());
         for (k, v) in &r.inner_html_changes {
             eprintln!("  {} (len {}): {}", k, v.len(),
