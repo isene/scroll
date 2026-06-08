@@ -61,6 +61,10 @@ pub struct FormField {
     pub placeholder: String,
     pub options: Vec<(String, String)>, // for select: (value, label)
     pub line: usize,
+    /// Plain (ANSI-stripped) bracket token as rendered into the content,
+    /// e.g. "[email: ________]" or "[Unsubscribe]". Used to reverse-
+    /// highlight the field inline when it's the TAB focus target.
+    pub render_token: String,
 }
 
 #[derive(Clone)]

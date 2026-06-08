@@ -1537,22 +1537,29 @@ impl App {
             None => return,
         };
         let line = f.line;
-        // No field highlight in the renderer yet — just scroll to the
-        // line and surface the field's identity in the status bar so
-        // the user knows what ENTER will edit.
+        // Reverse-highlight the field's rendered token inline (same visual
+        // feedback links get), then scroll to it and surface its identity
+        // in the status bar.
+        let content = self.tabs[self.current_tab].content.clone();
+        let highlighted = renderer::highlight_token(&content, line, &f.render_token);
         self.clear_images();
         self.tabs[self.current_tab].ix = line.saturating_sub(3);
+        self.main.set_text(&highlighted);
         self.main.ix = self.tabs[self.current_tab].ix;
         self.main.full_refresh();
         if self.conf.show_images { self.show_visible_images(); }
-        let label = if !f.id.is_empty() { format!("#{}", f.id) }
+        let is_submit = f.field_type == "submit";
+        let label = if is_submit { f.value.clone() }
+                    else if !f.id.is_empty() { format!("#{}", f.id) }
                     else if !f.name.is_empty() { format!("[name={}]", f.name) }
                     else { format!("({})", f.field_type) };
         let typ = if f.field_type.is_empty() { "input".to_string() } else { f.field_type.clone() };
+        let action = if is_submit { "Enter to submit" } else { "Enter to edit" };
         self.status.say(&format!(
-            " {} {} — Enter to edit",
+            " {} {} — {}",
             style::fg(&format!("[{}]", typ), self.conf.c_link_num as u8),
-            style::reverse(&label)
+            style::reverse(&label),
+            action
         ));
     }
 
@@ -1718,7 +1725,17 @@ impl App {
                         return;
                     }
                     FocusItem::Field { form, field } => {
-                        self.edit_focused_field(form, field);
+                        // A focused submit button submits its form; any
+                        // other field opens the edit prompt.
+                        let is_submit = self.tab().forms.get(form)
+                            .and_then(|f| f.fields.get(field))
+                            .map(|fld| fld.field_type == "submit")
+                            .unwrap_or(false);
+                        if is_submit {
+                            self.fill_form_idx(form);
+                        } else {
+                            self.edit_focused_field(form, field);
+                        }
                         return;
                     }
                 }
@@ -1765,9 +1782,17 @@ impl App {
         self.open_href_in_new_tab(&href);
     }
 
+    /// `f` — fill + submit the first form on the page.
     fn fill_form(&mut self) {
-        if self.tab().forms.is_empty() { return; }
-        let form = self.tab().forms[0].clone();
+        self.fill_form_idx(0);
+    }
+
+    /// Fill (prompt each editable field) and submit the form at `form_idx`.
+    /// Called with 0 by `f`, or with the focused submit button's form
+    /// index when ENTER activates a button.
+    fn fill_form_idx(&mut self, form_idx: usize) {
+        if self.tab().forms.get(form_idx).is_none() { return; }
+        let form = self.tab().forms[form_idx].clone();
         let mut params = HashMap::new();
 
         // Resolve credentials for the current host once — used to
@@ -1790,6 +1815,13 @@ impl App {
                 "hidden" => {
                     let v = js_value.unwrap_or_else(|| field.value.clone());
                     params.insert(field.name.clone(), v);
+                }
+                "submit" => {
+                    // Not prompted. A named submit contributes its value
+                    // as a param (browser behavior); unnamed ones don't.
+                    if !field.name.is_empty() {
+                        params.insert(field.name.clone(), field.value.clone());
+                    }
                 }
                 "password" => {
                     let default = js_value

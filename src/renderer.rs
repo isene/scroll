@@ -103,6 +103,50 @@ pub fn highlight_link(content: &str, links: &[Link], focus_idx: usize) -> String
     }).collect::<Vec<_>>().join("\n")
 }
 
+/// Reverse-highlight a known plain `token` (a form field's render_token,
+/// e.g. "[email: ________]" or "[Unsubscribe]") on `target_line`,
+/// ANSI-aware. Same rebuild approach as highlight_link but for an exact
+/// literal token rather than a link's text+marker. No-op if the token
+/// isn't found on that line.
+pub fn highlight_token(content: &str, target_line: usize, token: &str) -> String {
+    if token.is_empty() { return content.to_string(); }
+    content.lines().enumerate().map(|(i, line)| {
+        if i != target_line { return line.to_string(); }
+        let plain = crust::strip_ansi(line);
+        let Some(byte_pos) = plain.find(token) else { return line.to_string(); };
+        // Work in visible-char counts (tokens contain multi-byte ● / ▼).
+        let char_pos = plain[..byte_pos].chars().count();
+        let char_end = char_pos + token.chars().count();
+        let mut result = String::new();
+        let mut visible = 0;
+        let mut in_escape = false;
+        let mut in_tok = false;
+        let mut buf = String::new();
+        for ch in line.chars() {
+            if ch == '\x1b' { in_escape = true; }
+            if in_escape {
+                if in_tok { buf.push(ch); } else { result.push(ch); }
+                if ch.is_ascii_alphabetic() { in_escape = false; }
+                continue;
+            }
+            if visible == char_pos && !in_tok { in_tok = true; }
+            if in_tok {
+                buf.push(ch);
+                visible += 1;
+                if visible == char_end {
+                    result.push_str(&style::reverse(&buf));
+                    in_tok = false;
+                }
+            } else {
+                result.push(ch);
+                visible += 1;
+            }
+        }
+        if in_tok { result.push_str(&style::reverse(&buf)); }
+        result
+    }).collect::<Vec<_>>().join("\n")
+}
+
 pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::config::Config) -> RenderResult {
     // Strip CSS-hidden elements before parsing. Newsletter HTML
     // (Substack, TLDR, GitHub digest, etc.) ships an inbox-preview
@@ -416,22 +460,28 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
                     }
                 }
                 "submit" => {
-                    let label = if value.is_empty() { "Submit" } else { &value };
-                    ctx.append(&style::fb(label, 0, 252));
+                    let label = if value.is_empty() { "Submit".to_string() } else { value };
+                    let token = format!("[{}]", label);
+                    if let Some(form) = ctx.forms.last_mut() {
+                        form.fields.push(FormField { field_type: "submit".into(), name, id, value: label.clone(), line, render_token: token.clone(), ..Default::default() });
+                    }
+                    ctx.append(&style::fb(&token, 0, 252));
                     ctx.append(" ");
                 }
                 "password" => {
+                    let token = format!("[{}: \u{25CF}\u{25CF}\u{25CF}\u{25CF}]", placeholder);
                     if let Some(form) = ctx.forms.last_mut() {
-                        form.fields.push(FormField { field_type: "password".into(), name, id, value, placeholder: placeholder.clone(), line, ..Default::default() });
+                        form.fields.push(FormField { field_type: "password".into(), name, id, value, placeholder: placeholder.clone(), line, render_token: token.clone(), ..Default::default() });
                     }
-                    ctx.append(&style::fg(&format!("[{}: \u{25CF}\u{25CF}\u{25CF}\u{25CF}]", placeholder), 252));
+                    ctx.append(&style::fg(&token, 252));
                     ctx.newline();
                 }
                 _ => {
+                    let token = format!("[{}: ________]", placeholder);
                     if let Some(form) = ctx.forms.last_mut() {
-                        form.fields.push(FormField { field_type: itype, name, id, value, placeholder: placeholder.clone(), line, ..Default::default() });
+                        form.fields.push(FormField { field_type: itype, name, id, value, placeholder: placeholder.clone(), line, render_token: token.clone(), ..Default::default() });
                     }
-                    ctx.append(&style::fg(&format!("[{}: ________]", placeholder), 252));
+                    ctx.append(&style::fg(&token, 252));
                     ctx.newline();
                 }
             }
@@ -446,14 +496,15 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
                     let label = opt.text().collect::<String>().trim().to_string();
                     (val, label)
                 }).collect();
+            let token = format!("[{} \u{25BC}]", name);
             if let Some(form) = ctx.forms.last_mut() {
                 form.fields.push(FormField {
                     field_type: "select".into(), name: name.clone(), id,
                     value: options.first().map(|o| o.0.clone()).unwrap_or_default(),
-                    options, line, ..Default::default()
+                    options, line, render_token: token.clone(), ..Default::default()
                 });
             }
-            ctx.append(&style::fg(&format!("[{} \u{25BC}]", name), 252));
+            ctx.append(&style::fg(&token, 252));
             ctx.newline();
         }
         "textarea" => {
@@ -461,14 +512,40 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             let id = el.value().attr("id").unwrap_or("").to_string();
             let line = ctx.lines.len();
             let text = el.text().collect::<String>();
+            let token = format!("[{}: ________]", name);
             if let Some(form) = ctx.forms.last_mut() {
                 form.fields.push(FormField {
                     field_type: "textarea".into(), name: name.clone(), id,
-                    value: text, line, ..Default::default()
+                    value: text, line, render_token: token.clone(), ..Default::default()
                 });
             }
-            ctx.append(&style::fg(&format!("[{}: ________]", name), 252));
+            ctx.append(&style::fg(&token, 252));
             ctx.newline();
+        }
+        "button" => {
+            // A <button> (default type=submit) is a form submitter. Render
+            // it as a focusable [Label] field so TAB reaches it and ENTER
+            // submits. Don't recurse into its children — that would
+            // double-render the label text.
+            let btype = el.value().attr("type").unwrap_or("submit").to_lowercase();
+            let label_text = el.text().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ");
+            let value = el.value().attr("value").unwrap_or("").to_string();
+            let label = if !label_text.is_empty() { label_text }
+                        else if !value.is_empty() { value }
+                        else { "Submit".to_string() };
+            let name = el.value().attr("name").unwrap_or("").to_string();
+            let id = el.value().attr("id").unwrap_or("").to_string();
+            let line = ctx.lines.len();
+            let token = format!("[{}]", label);
+            // type=button / type=reset don't submit; render but don't make
+            // them submit targets.
+            if btype != "button" && btype != "reset" {
+                if let Some(form) = ctx.forms.last_mut() {
+                    form.fields.push(FormField { field_type: "submit".into(), name, id, value: label.clone(), line, render_token: token.clone(), ..Default::default() });
+                }
+            }
+            ctx.append(&style::fb(&token, 0, 252));
+            ctx.append(" ");
         }
         "table" => {
             // Heuristic: a real data table has `<th>` AND no nested
