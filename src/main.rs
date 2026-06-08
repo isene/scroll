@@ -2001,8 +2001,12 @@ impl App {
 
     fn copy_url(&mut self) {
         let url = self.tab().url.clone();
+        if url.is_empty() {
+            self.status.say(" Nothing to copy (no page URL).");
+            return;
+        }
         crust::clipboard_copy(&url, "clipboard");
-        self.status.say(&format!(" Copied: {}", url));
+        self.say_copied(&url);
     }
 
     fn copy_focused_url(&mut self) {
@@ -2011,7 +2015,17 @@ impl App {
         if idx >= self.tab().links.len() { return; }
         let href = self.tab().links[idx].href.clone();
         crust::clipboard_copy(&href, "clipboard");
-        self.status.say(&format!(" Copied: {}", href));
+        self.say_copied(&href);
+    }
+
+    /// Show " Copied: <url>" in the status bar, truncating the URL to the bar
+    /// width. The full URL is on the clipboard regardless; this just keeps a
+    /// long URL from word-wrapping off the single-row status pane (which left
+    /// only " Copied:" visible).
+    fn say_copied(&mut self, url: &str) {
+        let prefix = " Copied: ";
+        let avail = (self.cols as usize).saturating_sub(crust::display_width(prefix));
+        self.status.say(&format!("{}{}", prefix, crust::truncate_ansi(url, avail)));
     }
 
     // --- Images ---
