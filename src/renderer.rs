@@ -239,8 +239,11 @@ fn walk_element(el: &ElementRef, ctx: &mut RenderContext) {
             Node::Text(text) => {
                 let t = text.text.as_ref();
                 if ctx.in_pre {
+                    // Preserve preformatted whitespace + the pre/code colour
+                    // (186), so the <pre> child-walk doesn't lose styling for
+                    // plain pre text (links inside still get their own colour).
                     for line in t.split('\n') {
-                        ctx.append(line);
+                        ctx.append(&style::fg(line, 186));
                         ctx.newline();
                     }
                 } else {
@@ -307,8 +310,10 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             ctx.ensure_blank_line();
             let was_pre = ctx.in_pre;
             ctx.in_pre = true;
-            let text = el.text().collect::<String>();
-            ctx.append(&style::fg(&text, 186));
+            // Walk children (not el.text()) so inline elements inside <pre> —
+            // notably <a> — register as real, followable links instead of being
+            // flattened to plain text. in_pre preserves the whitespace.
+            walk_element(el, ctx);
             ctx.in_pre = was_pre;
             ctx.ensure_blank_line();
         }
