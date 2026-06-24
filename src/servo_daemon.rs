@@ -10,7 +10,7 @@
 //! calls (so the second `:servo` to the same site can use the JS
 //! state from the first).
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -27,7 +27,6 @@ pub struct DaemonClient {
 pub struct NavResult {
     pub html: String,
     pub url: String,
-    pub frames: u64,
     /// True if the daemon hit its 15s load timeout; the HTML may be a
     /// partial-paint snapshot. Caller surfaces this so the user knows
     /// the rendering may be incomplete.
@@ -184,7 +183,6 @@ impl DaemonClient {
         Ok(NavResult {
             html: resp.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string(),
             url: resp.get("url").and_then(|v| v.as_str()).unwrap_or(url).to_string(),
-            frames: resp.get("frames").and_then(|v| v.as_u64()).unwrap_or(0),
             timed_out: resp.get("timed_out").and_then(|v| v.as_bool()).unwrap_or(false),
         })
     }
@@ -203,7 +201,6 @@ impl DaemonClient {
             Some("ok") => Ok(NavResult {
                 html: resp.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 url: String::new(),
-                frames: 0,
                 timed_out: false,
             }),
             Some("not_found") => Err(format!("no element matched selector {selector}")),
@@ -223,7 +220,6 @@ impl DaemonClient {
             Some("ok") => Ok(NavResult {
                 html: resp.get("html").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 url: resp.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                frames: 0,
                 timed_out: false,
             }),
             Some("not_found") => Err(format!("no element matched selector {selector}")),

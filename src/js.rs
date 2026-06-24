@@ -77,7 +77,6 @@ pub struct JsResult {
     /// override field values that JS set programmatically (e.g. a
     /// hidden CSRF input the JS populates from a cookie).
     pub dom_values: HashMap<String, String>,
-    pub dom_dirty: bool,
     /// Inline + external script bodies extracted from the page in
     /// document order. Saved on the tab so submit-time re-runs can
     /// fire the same listener set without re-fetching externals.
@@ -137,7 +136,6 @@ struct JsState {
     /// HTML before scripts run, then mutated as JS sets .value /
     /// .innerHTML / etc.
     dom: HashMap<String, ElementState>,
-    dom_dirty: bool,
     /// Page host (without scheme/path) — used by fetch() to decide
     /// which cookies and which Origin header to send.
     page_host: String,
@@ -300,14 +298,6 @@ pub fn run_extracted(
     r
 }
 
-/// Public, host-callable extractor: pulls inline + external scripts
-/// in document order, returns their bodies. Stored on the tab so
-/// the submit-time re-run doesn't have to re-fetch external
-/// scripts.
-pub fn extract_scripts(html: &str, page_url: &str, cookies: &HashMap<String, String>) -> Vec<String> {
-    extract_scripts_in_order(html, page_url, cookies)
-}
-
 fn finish_run() -> JsResult {
     STATE.with(|s| {
         let st = s.borrow();
@@ -335,7 +325,6 @@ fn finish_run() -> JsResult {
             localstorage: st.local_storage.clone(),
             localstorage_dirty: st.local_storage_dirty,
             dom_values,
-            dom_dirty: st.dom_dirty,
             scripts: Vec::new(),  // filled in by run_extracted
             submit_prevented: st.submit_prevented,
             inner_html_changes,
@@ -515,23 +504,6 @@ fn make_http() -> Option<(tokio::runtime::Runtime, rquest::Client)> {
         .ok()?;
     Some((rt, client))
 }
-
-fn fetch_script(url: &str, cookies: &HashMap<String, String>, budget: usize) -> Option<String> {
-    let (rt, client) = make_http()?;
-    rt.block_on(async {
-        let mut req = client.get(url);
-        if !cookies.is_empty() {
-            let cs: String = cookies.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("; ");
-            req = req.header("Cookie", cs);
-        }
-        let resp = req.send().await.ok()?;
-        let bytes = resp.bytes().await.ok()?;
-        // Cap to budget so a runaway CDN can't fill memory.
-        let take = bytes.len().min(budget);
-        Some(String::from_utf8_lossy(&bytes[..take]).into_owned())
-    })
-}
-
 
 fn install_globals(ctx: &mut Context, page_url: &str) -> BoaResult<()> {
     // ---------- console ----------
@@ -1127,7 +1099,6 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
         STATE.with(|s| {
             let mut st = s.borrow_mut();
             st.dom.entry(id).or_default().value = new_val;
-            st.dom_dirty = true;
         });
         Ok(JsValue::undefined())
     }).to_js_function(&realm);
@@ -1145,7 +1116,6 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
         STATE.with(|s| {
             let mut st = s.borrow_mut();
             st.dom.entry(id).or_default().inner_html = new_val;
-            st.dom_dirty = true;
         });
         Ok(JsValue::undefined())
     }).to_js_function(&realm);
@@ -1163,7 +1133,6 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
         STATE.with(|s| {
             let mut st = s.borrow_mut();
             st.dom.entry(id).or_default().text_content = new_val;
-            st.dom_dirty = true;
         });
         Ok(JsValue::undefined())
     }).to_js_function(&realm);
@@ -1180,7 +1149,6 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
         STATE.with(|s| {
             let mut st = s.borrow_mut();
             st.dom.entry(id).or_default().checked = new_val;
-            st.dom_dirty = true;
         });
         Ok(JsValue::undefined())
     }).to_js_function(&realm);
@@ -1228,7 +1196,6 @@ fn make_element_object(ctx: &mut Context, id: &str) -> BoaResult<boa_engine::JsO
             STATE.with(|s| {
                 let mut st = s.borrow_mut();
                 st.dom.entry(id).or_default().attributes.insert(name, val);
-                st.dom_dirty = true;
             });
             Ok(JsValue::undefined())
         }), js_string!("setAttribute"), 2)
@@ -1451,7 +1418,6 @@ mod dom_fetch_tests {
         assert!(r.log.iter().any(|l| l.contains("tag: INPUT")), "log: {:?}", r.log);
         assert!(r.log.iter().any(|l| l.contains("value: initial")), "log: {:?}", r.log);
         assert!(r.log.iter().any(|l| l.contains("after: typed-by-js")), "log: {:?}", r.log);
-        assert!(r.dom_dirty);
         assert_eq!(r.dom_values.get("user").map(|s| s.as_str()), Some("typed-by-js"));
     }
 
@@ -1477,7 +1443,7 @@ mod dom_fetch_tests {
             </script>
         </body></html>"#;
         // First run: registers the listener via inline script.
-        let scripts = extract_scripts(html, "https://example.com/", &Default::default());
+        let scripts = extract_scripts_in_order(html, "https://example.com/", &Default::default());
         // Second (simulated submit-time) run: dispatch a synthetic submit.
         let r = run_extracted(
             scripts, html, "https://example.com/",
@@ -1523,7 +1489,7 @@ mod dom_fetch_tests {
         let html = r#"<html><body><form id="login"></form>
             <script>console.log("no listener");</script>
         </body></html>"#;
-        let scripts = extract_scripts(html, "https://example.com/", &Default::default());
+        let scripts = extract_scripts_in_order(html, "https://example.com/", &Default::default());
         let r = run_extracted(
             scripts, html, "https://example.com/",
             Default::default(), Default::default(),

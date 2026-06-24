@@ -930,7 +930,7 @@ impl App {
             self.tab_mut().title = filename.clone();
             self.tab_mut().url = url.clone();
             self.tab_mut().images = vec![crate::tab::ImageRef {
-                src: url, alt: filename, line: 0, height: reserve,
+                src: url, line: 0, height: reserve,
             }];
         } else if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
             let width = self.main.w as usize;

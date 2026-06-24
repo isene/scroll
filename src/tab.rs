@@ -49,7 +49,6 @@ pub struct Form {
     pub action: String,
     pub method: String,
     pub fields: Vec<FormField>,
-    pub line: usize,
 }
 
 #[derive(Clone, Default)]
@@ -70,7 +69,6 @@ pub struct FormField {
 #[derive(Clone)]
 pub struct ImageRef {
     pub src: String,
-    pub alt: String,
     pub line: usize,
     pub height: usize,
 }

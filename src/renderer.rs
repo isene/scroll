@@ -411,7 +411,6 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
         "img" => {
             let src = el.value().attr("src").or_else(|| el.value().attr("data-src")).unwrap_or("");
             if src.is_empty() { return; }
-            let alt = el.value().attr("alt").unwrap_or("image");
             let resolved = resolve_url(&ctx.base_url, src);
             // Pick a reserve height proportional to the image's
             // declared dimensions. Marketing emails / Outlook are
@@ -436,15 +435,14 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
             if reserve == 0 { return; }
             if !ctx.current_line.is_empty() { ctx.newline(); }
             let line = ctx.lines.len();
-            ctx.images.push(ImageRef { src: resolved, alt: alt.to_string(), line, height: reserve });
+            ctx.images.push(ImageRef { src: resolved, line, height: reserve });
             for _ in 0..reserve { ctx.lines.push(String::new()); }
             ctx.col = 0;
         }
         "form" => {
             let action = el.value().attr("action").unwrap_or("").to_string();
             let method = el.value().attr("method").unwrap_or("get").to_uppercase();
-            let line = ctx.lines.len();
-            ctx.forms.push(Form { action: resolve_url(&ctx.base_url, &action), method, fields: Vec::new(), line });
+            ctx.forms.push(Form { action: resolve_url(&ctx.base_url, &action), method, fields: Vec::new() });
             ctx.ensure_blank_line();
             ctx.append(&style::bold(&style::fg("[Form]", 208)));
             ctx.newline();
