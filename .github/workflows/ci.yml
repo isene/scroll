@@ -9,16 +9,16 @@ jobs:
     name: Check & Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: scroll
       - name: Checkout crust
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/crust
           path: crust
       - name: Checkout glow
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: isene/glow
           path: glow
