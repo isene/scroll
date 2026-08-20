@@ -2984,6 +2984,18 @@ fn resolve_search(input: &str, default_engine: &str) -> String {
     if input.starts_with("http://") || input.starts_with("https://") || input.starts_with("file://") || input.starts_with("about:") {
         return input.to_string();
     }
+    // A path to a file on disk is that file. Checked before the
+    // bare-domain rule below, which otherwise reads `page.html` as a
+    // domain (it has a dot) and sends it to https://page.html.
+    let expanded = match input.strip_prefix("~/") {
+        Some(rest) => format!("{}/{}", std::env::var("HOME").unwrap_or_default(), rest),
+        None => input.to_string(),
+    };
+    if let Ok(p) = std::fs::canonicalize(&expanded) {
+        if p.is_file() {
+            return format!("file://{}", p.display());
+        }
+    }
     if input.contains('.') && !input.contains(' ') {
         return format!("https://{}", input);
     }
