@@ -113,6 +113,7 @@ Press `?` for built-in help. Press `q` to quit.
 |-----|--------|
 | i | Toggle images |
 | I | AI page summary |
+| Ctrl-A | Talk to Claude about this page, with follow-up questions |
 | P | Preferences popup |
 | Ctrl-L | Force redraw |
 | : | Command mode |

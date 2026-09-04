@@ -395,6 +395,7 @@ fn main() {
             "P" => { app.show_preferences(); }
             "?" => { app.show_help(); }
             "I" => { app.ai_summary(); }
+            "C-A" => { app.ai_chat(); }
             "C-L" => { app.force_redraw(); }
 
             // Commands
@@ -2273,6 +2274,7 @@ impl App {
             format!(" {}", h("Other")),
             "   i                  toggle images".into(),
             "   I                  AI page summary".into(),
+            "   Ctrl-A             Talk to Claude about this page".into(),
             "   P                  preferences".into(),
             "   C-l                hard redraw (resets kitty image state)".into(),
             "   :                  command mode (see below)".into(),
@@ -2381,6 +2383,13 @@ impl App {
             let json_str = String::from_utf8_lossy(&o.stdout);
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 let summary = json["choices"][0]["message"]["content"].as_str().unwrap_or("No response");
+                // The page's images belong to text that is no longer on
+                // screen. Drop them from the tab, then take the placements
+                // down: render_main re-places whatever the tab still lists,
+                // so clearing alone would put them straight back over the
+                // summary. They return on reload.
+                self.tab_mut().images.clear();
+                self.clear_images();
                 self.tab_mut().content = format!("{}\n\n{}", style::bold("AI Summary"), summary);
                 self.tab_mut().ix = 0;
                 self.render_main();
@@ -2388,6 +2397,43 @@ impl App {
             }
         }
         self.status.say(&style::fg(" AI request failed", 196));
+    }
+
+    /// `Ctrl-A` — talk to Claude about this page, for as long as you
+    /// like. The page text goes to a file and the terminal goes to
+    /// `claude`, so the whole session is there: follow-up questions, the
+    /// web, your files. scroll picks its screen back up on exit. Same
+    /// shape as kastrup's Ctrl-A, so the two feel like one thing.
+    fn ai_chat(&mut self) {
+        let (title, url) = (self.tab().title.clone(), self.tab().url.clone());
+        let text = crust::strip_ansi(&self.tab().content);
+        if text.trim().is_empty() {
+            self.status.say(&style::fg(" Nothing on this page to discuss", 220));
+            return;
+        }
+        let tmpfile = format!("/tmp/scroll_page_{}.txt", std::process::id());
+        if std::fs::write(&tmpfile, &text).is_err() {
+            self.status.say(&style::fg(" Could not write the page out", 196));
+            return;
+        }
+        let initial = format!(
+            "I am reading this page in scroll, my terminal browser, and want to talk about it.\n\n\
+             Title: {}\nURL: {}\n\n\
+             The text is in {} — read it first, then answer briefly. \
+             Ask me what I want to know if I have not said.",
+            title, url, tmpfile);
+
+        self.status.say(" Handing over to claude...");
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        Crust::cleanup();
+        Crust::clear_screen();
+        let _ = std::process::Command::new("claude").arg(&initial).status();
+        Crust::init();
+        let _ = std::fs::remove_file(&tmpfile);
+        self.clear_images();
+        self.render_all();
+        self.status.say(" Back from claude");
     }
 
     // --- Command mode ---
