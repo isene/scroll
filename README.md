@@ -25,6 +25,9 @@ scroll isene.org
 # Search
 scroll g rust terminal browser
 
+# Run the page's scripts too
+scroll --js example.com
+
 # Open local file
 scroll file:///path/to/page.html
 ```
@@ -57,6 +60,7 @@ Press `?` for built-in help. Press `q` to quit.
 - **Stop a slow page**: `Esc` drops a page that is still loading
 - **Claude**: `I` sums the page up, `Ctrl-A` opens a full Claude session about it (both need [Claude Code](https://claude.com/claude-code); no API key)
 - **PDF, sound and film**: a PDF link opens in [folio](https://github.com/isene/folio), sound and film in mpv, where those are installed
+- **Scripts**: `scroll --js` runs a page's inline scripts: text they write is shown, and a page that sends the browser on is followed
 - **Preferences**: Interactive popup (P key) with 20 configurable settings including colors
 - **Search engines**: Google (g), DuckDuckGo (ddg), Wikipedia (w)
 - **Downloads**: `:download` saves the focused link, the page or a URL, byte for byte

@@ -65,6 +65,8 @@ struct App {
     /// or cookie writes. Tier 3 (Servo) is orthogonal to this and
     /// always available via `S` / `:servo`.
     js_enabled: bool,
+    /// How many script redirects deep the current page open is.
+    js_hops: u8,
     /// True when scroll was launched with a positional URL argument
     /// (one-shot mode, no session restore, no save). Used to suppress
     /// session-only chrome like the set chips — ephemeral runs are
@@ -203,6 +205,7 @@ fn main() {
         fetcher: Fetcher::new_with_set(&initial_set),
         servo_client: servo_daemon::DaemonClient::new(),
         js_enabled,
+        js_hops: 0,
         ephemeral,
         tabs: Vec::new(),
         current_tab: 0,
@@ -1070,18 +1073,14 @@ impl App {
                 }];
             }
             Kind::Page => {
-                let width = self.main.w as usize;
-                let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
-                self.tab_mut().content = rendered.text;
-                self.tab_mut().title = rendered.title;
-                self.tab_mut().links = rendered.links;
-                self.tab_mut().forms = rendered.forms;
-                self.tab_mut().images = rendered.images;
-                self.tab_mut().url = result.url;
-                self.tab_mut().site_bg = rendered.site_bg;
-                self.tab_mut().site_fg = rendered.site_fg;
-                // Kept for the reader view (`R`).
-                self.tab_mut().raw_html = result.body;
+                // Every page takes the one path through `load_result`,
+                // so `--js` runs a page's scripts on a plain open too.
+                // It used to run them only on back, forward and a sent
+                // form.
+                self.search_term.clear();
+                self.search_matches.clear();
+                self.load_result(result);
+                return;
             }
             Kind::Pdf | Kind::Media | Kind::File => {
                 // A file scroll cannot show: offer to save it.
@@ -1135,7 +1134,8 @@ impl App {
         self.tab_mut().servo_rendered = false;
         self.tab_mut().full = None;
         let width = self.main.w as usize;
-        if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
+        let mut looped = false;
+        if kind_of(&result.content_type, &result.url) == Kind::Page {
             let effective_html = if self.js_enabled {
                 // Tier 2: boa engine on inline scripts. Cookies / RSC /
                 // window.location redirects all flow through here.
@@ -1164,11 +1164,28 @@ impl App {
                     effective = apply_inner_html_changes(&effective, &js.inner_html_changes);
                 }
                 if let Some(target) = js.redirect {
-                    if !target.is_empty() && target != result.url {
-                        let resolved = renderer::resolve_url(&result.url, &target);
-                        self.status.say(&format!(" JS redirect → {}", &resolved));
-                        self.navigate(&resolved);
-                        return;
+                    let resolved = renderer::resolve_url(&result.url, &target);
+                    if !target.is_empty() && resolved != result.url {
+                        // Two pages that send the browser to each other
+                        // would never end: after five hops this page stays.
+                        if self.js_hops < 5 {
+                            self.status.say(&format!(" JS redirect → {}", &resolved));
+                            let depth = self.tab().back_history.len();
+                            self.js_hops += 1;
+                            self.navigate(&resolved);
+                            self.js_hops -= 1;
+                            if self.tab().back_history.len() > depth {
+                                // The page that sent the browser on is no
+                                // place to go back to: Back would only be
+                                // sent on again.
+                                self.tab_mut().back_history.remove(depth);
+                                return;
+                            }
+                            // The next page never came (Esc, or a file
+                            // handed to folio or mpv): show this one.
+                        } else {
+                            looped = true;
+                        }
                     }
                 }
                 if let Some(rsc) = &js.rsc_text {
@@ -1213,6 +1230,9 @@ impl App {
         self.render_all();
         self.start_image_downloads();
         self.check_autofill();
+        if looped {
+            self.status.say(&style::fg(" Stayed here: this page's scripts keep sending the browser on", 220));
+        }
     }
 
     // --- Scrolling ---
