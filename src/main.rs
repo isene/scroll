@@ -2981,15 +2981,14 @@ impl App {
     }
 
     fn force_redraw(&mut self) {
-        // Step 1: hard-reset the terminal's kitty graphics state.
-        // `\x1b_Ga=d\x1b\\` (no `d=`) tells kitty/glass to free EVERY
-        // image record. This unsticks glass when its IMG_SLOTS table
-        // (capped at 32) has filled up and silently dropped placements.
+        // Step 1: have the terminal drop every image placement it is
+        // holding, ours or not. This unsticks glass when its table of
+        // placements has filled up and it silently drops new ones.
         // Without this, force_redraw just re-runs the same churn that
         // wedged the state in the first place.
-        use std::io::Write as _;
-        print!("\x1b_Ga=d\x1b\\");
-        let _ = std::io::stdout().flush();
+        if let Some(display) = self.image_display.as_mut() {
+            display.clear_all();
+        }
 
         // Step 2: drop and re-create our glow::Display so the local
         // image_cache + active_ids tables also start clean. Without
