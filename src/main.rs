@@ -2364,7 +2364,7 @@ impl App {
         }
         self.status.say(" Asking AI...");
         let content = crust::strip_ansi(&self.tab().content);
-        let text = if content.len() > 4000 { &content[..4000] } else { &content };
+        let text = head(&content, 4000);
         let body = serde_json::json!({
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": format!(
@@ -3109,6 +3109,10 @@ fn find_element_inner_range(html: &str, wanted_id: &str) -> Option<(usize, usize
     Some((open_end, close_start))
 }
 
+/// The first `n` bytes of `s`, cut back to a whole character. A plain
+/// `&s[..n]` panics when byte `n` is inside an æ or a curly quote.
+fn head(s: &str, n: usize) -> &str { &s[..s.floor_char_boundary(n)] }
+
 fn urlencoding(s: &str) -> String {
     let mut result = String::new();
     for b in s.bytes() {
@@ -3146,7 +3150,7 @@ impl PrefItem {
             }
             PrefItem::Choice(_, _, v) => style::fg(v, 81),
             PrefItem::Text(_, v) => {
-                if v.len() > 25 { format!("{}...", &v[..22]) } else { v.clone() }
+                if v.len() > 25 { format!("{}...", head(v, 22)) } else { v.clone() }
             }
             PrefItem::Color(_, c) => {
                 format!("{} {:>3}", style::fg("\u{2588}\u{2588}\u{2588}", *c as u8), c)
@@ -3176,5 +3180,17 @@ impl PrefItem {
             PrefItem::Color(_, c) => *c = if *c == 0 { 255 } else { *c - 1 },
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::head;
+
+    #[test]
+    fn a_cut_never_lands_inside_a_character() {
+        assert_eq!(head("aæb", 2), "a");
+        assert_eq!(head("aæb", 3), "aæ");
+        assert_eq!(head("abc", 10), "abc");
     }
 }

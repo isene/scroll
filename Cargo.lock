@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-crust"
-version = "0.1.53"
+version = "0.1.61"
 dependencies = [
  "crossterm",
  "libc",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "fe2o3-glow"
-version = "0.1.25"
+version = "0.1.49"
 dependencies = [
  "base64",
  "image",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "scroll"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "boa_engine",
  "fe2o3-crust",
