@@ -388,6 +388,7 @@ fn main() {
             // Bookmarks & quickmarks
             "b" => { app.bookmark_current(); }
             "B" => { app.show_bookmarks(); }
+            "F" => { app.feed_to_kastrup(); }
             "m" => { app.set_quickmark(); }
             "'" => { app.goto_quickmark(); }
 
@@ -2152,6 +2153,34 @@ impl App {
         self.status.say(&style::fg(&format!(" Bookmarked: {}", title), 82));
     }
 
+    /// F: the page's news feed goes to kastrup, which reads it from then
+    /// on. With several feeds on a page, the first one named is taken.
+    fn feed_to_kastrup(&mut self) {
+        let feeds = {
+            let t = self.tab();
+            let page = if t.raw_html.is_empty() { &t.content } else { &t.raw_html };
+            renderer::feeds(page, &t.url, &t.title)
+        };
+        let Some((url, name)) = feeds.first() else {
+            self.status.say(&style::fg(" This page names no news feed", 220));
+            return;
+        };
+        let out = std::process::Command::new("kastrup").args(["--add-feed", url, name]).output();
+        let (line, colour) = match out {
+            Err(_) => (" kastrup is not installed, so the feed has nowhere to go".to_string(), 196),
+            Ok(o) => {
+                let ok = o.status.success();
+                let said = String::from_utf8_lossy(if ok { &o.stdout } else { &o.stderr });
+                let mut line = format!(" {}", said.lines().next().unwrap_or("kastrup said nothing"));
+                if ok && feeds.len() > 1 {
+                    line.push_str(&format!(" (the first of {} feeds here)", feeds.len()));
+                }
+                (line, if ok { 82 } else { 196 })
+            }
+        };
+        self.status.say(&style::fg(&line, colour));
+    }
+
     fn show_bookmarks(&mut self) {
         if self.bookmarks.is_empty() {
             self.status.say(" No bookmarks");
@@ -2433,6 +2462,7 @@ impl App {
             format!(" {}", h("Bookmarks & quickmarks")),
             "   b                  bookmark current page".into(),
             "   B                  show bookmarks".into(),
+            "   F                  send the page's news feed to kastrup".into(),
             "   m{key}             set quickmark".into(),
             "   '{key}             go to quickmark".into(),
             String::new(),

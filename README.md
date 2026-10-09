@@ -114,6 +114,7 @@ Press `?` for built-in help. Press `q` to quit.
 | n / N | Next/prev match |
 | b | Bookmark page |
 | B | Show bookmarks |
+| F | Send the page's news feed (RSS or Atom) to kastrup |
 | m + key | Set quickmark |
 | ' + key | Go to quickmark |
 

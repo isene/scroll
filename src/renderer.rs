@@ -780,6 +780,37 @@ pub fn resolve_url(base: &str, href: &str) -> String {
     href.to_string()
 }
 
+/// The news feeds a page names in its head, as address and name, in the
+/// order of the page. A page that is a feed itself gives its own address.
+pub fn feeds(html: &str, base_url: &str, page_title: &str) -> Vec<(String, String)> {
+    let top: String = html.chars().take(1000).collect();
+    if !top.contains("<html") && (top.contains("<rss") || top.contains("<feed") || top.contains("<rdf:RDF")) {
+        return vec![(base_url.to_string(), page_title.to_string())];
+    }
+    static LINK: OnceLock<scraper::Selector> = OnceLock::new();
+    let link = LINK.get_or_init(|| scraper::Selector::parse("link[href]").unwrap());
+    let mut out: Vec<(String, String)> = Vec::new();
+    for el in Html::parse_document(html).select(link) {
+        let v = el.value();
+        let attr = |name: &str| v.attr(name).unwrap_or("").trim();
+        if !attr("rel").split_ascii_whitespace().any(|r| r.eq_ignore_ascii_case("alternate")) {
+            continue;
+        }
+        let kind = attr("type").to_ascii_lowercase();
+        if (kind != "application/rss+xml" && kind != "application/atom+xml") || attr("href").is_empty() {
+            continue;
+        }
+        let url = resolve_url(base_url, attr("href"));
+        if out.iter().any(|(u, _)| *u == url) {
+            continue;
+        }
+        // WordPress calls its main feed "Site name » Feed".
+        let name = if attr("title").is_empty() { page_title } else { attr("title") };
+        out.push((url, name.trim_end_matches("» Feed").trim().to_string()));
+    }
+    out
+}
+
 fn extract_youtube_id(src: &str) -> Option<String> {
     let pos = src.find("/embed/")?;
     let rest = &src[pos + 7..];
@@ -935,6 +966,25 @@ mod tests {
     fn reader(body: &str) -> Option<RenderResult> {
         let html = format!("<html><head><title>Site title</title></head><body>{}</body></html>", body);
         render_article(&html, 80, "https://example.com/a", &conf())
+    }
+
+    #[test]
+    fn a_page_names_its_feeds_and_a_feed_names_itself() {
+        let page = "<html><head><title>Page title</title>\
+            <link rel=\"stylesheet\" href=\"/a.css\">\
+            <link rel=\"alternate\" hreflang=\"no\" href=\"/no/\">\
+            <link rel=\"alternate\" type=\"application/rss+xml\" title=\"Example » Feed\" href=\"/feed/\">\
+            <link rel=\"Alternate\" type=\"application/atom+xml\" href=\"https://feeds.example.net/atom\">\
+            <link rel=\"alternate\" type=\"application/rss+xml\" title=\"Again\" href=\"/feed/\">\
+            </head><body><p>Text</p></body></html>";
+        assert_eq!(feeds(page, "https://example.com/blog/post", "Page title"), vec![
+            ("https://example.com/feed/".to_string(), "Example".to_string()),
+            ("https://feeds.example.net/atom".to_string(), "Page title".to_string()),
+        ]);
+        assert!(feeds("<html><head><title>T</title></head><body></body></html>", "https://example.com/", "T").is_empty());
+        let rss = "<?xml version=\"1.0\"?>\n<rss version=\"2.0\"><channel><title>X</title></channel></rss>";
+        assert_eq!(feeds(rss, "https://example.com/rss.xml", ""),
+                   vec![("https://example.com/rss.xml".to_string(), String::new())]);
     }
 
     #[test]

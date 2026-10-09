@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "scroll"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "boa_engine",
  "fe2o3-crust",
