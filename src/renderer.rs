@@ -7,6 +7,8 @@ const IMG_RESERVE: usize = 10;
 
 // Pre-compiled CSS selectors (compiled once, reused across all renders)
 fn sel_title() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("title").unwrap()) }
+fn sel_p() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("p").unwrap()) }
+fn sel_h1() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("h1").unwrap()) }
 fn sel_body() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("body").unwrap()) }
 fn sel_img() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("img").unwrap()) }
 fn sel_option() -> &'static scraper::Selector { static S: OnceLock<scraper::Selector> = OnceLock::new(); S.get_or_init(|| scraper::Selector::parse("option").unwrap()) }
@@ -174,6 +176,7 @@ pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::confi
         list_stack: Vec::new(),
         base_url: base_url.to_string(),
         conf,
+        reader: false,
     };
 
     let title = doc.root_element()
@@ -215,6 +218,137 @@ pub fn render_html(html: &str, width: usize, base_url: &str, conf: &crate::confi
     }
 }
 
+/// The reader view: the page's article alone, without menus, sidebars,
+/// comment threads and footers. `None` when the page has no block of
+/// running text to call an article (a front page, a search form).
+pub fn render_article(html: &str, width: usize, base_url: &str, conf: &crate::config::Config) -> Option<RenderResult> {
+    let stripped = hidden_element_re().replace_all(html, "");
+    let doc = Html::parse_document(&stripped);
+    let root = article_root(&doc)?;
+    let mut ctx = RenderContext {
+        lines: Vec::new(),
+        current_line: String::new(),
+        col: 0,
+        width,
+        links: Vec::new(),
+        forms: Vec::new(),
+        images: Vec::new(),
+        link_index: 0,
+        indent: 0,
+        in_pre: false,
+        list_stack: Vec::new(),
+        base_url: base_url.to_string(),
+        conf,
+        reader: true,
+    };
+
+    let title = doc.root_element()
+        .select(sel_title())
+        .next()
+        .map(|t| t.text().collect::<String>().trim().to_string())
+        .unwrap_or_default();
+
+    // A headline that sits outside the article block would be lost, so
+    // the page's own goes on top.
+    if root.select(sel_h1()).next().is_none() {
+        let headline = doc.select(sel_h1()).next()
+            .map(|h| collapse_whitespace(&h.text().collect::<String>()).trim().to_string())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| title.clone());
+        if !headline.is_empty() {
+            ctx.append(&style::bold(&style::fg(&headline, ctx.conf.c_h1 as u8)));
+            ctx.newline();
+            ctx.newline();
+        }
+    }
+
+    walk_element(&root, &mut ctx);
+    if !ctx.current_line.is_empty() {
+        ctx.lines.push(std::mem::take(&mut ctx.current_line));
+    }
+
+    Some(RenderResult {
+        text: ctx.lines.join("\n"),
+        links: ctx.links,
+        forms: ctx.forms,
+        images: ctx.images,
+        title,
+        site_bg: None,
+        site_fg: None,
+    })
+}
+
+/// The element that carries a page's article.
+///
+/// Every paragraph of running text gives its length to its parent, and
+/// half of it to the parent above, so a text split over several
+/// sections still adds up in the block around them. The block with the
+/// most wins. Where that block sits inside an `<article>`, the article
+/// is taken, since it also has the headline and the pictures.
+fn article_root(doc: &Html) -> Option<ElementRef<'_>> {
+    let mut score = std::collections::HashMap::new();
+    for p in doc.select(sel_p()) {
+        let len = p.text().map(|t| t.trim().chars().count()).sum::<usize>();
+        // A line of a menu or a byline is not running text.
+        if len < 40 { continue; }
+        if p.ancestors().filter_map(ElementRef::wrap).any(|a| furniture(&a)) { continue; }
+        let Some(parent) = p.parent() else { continue };
+        *score.entry(parent.id()).or_insert(0usize) += len;
+        if let Some(above) = parent.parent() {
+            *score.entry(above.id()).or_insert(0usize) += len / 2;
+        }
+    }
+    // In page order, so two blocks with the same score give the same
+    // answer every time: the first.
+    let mut best: Option<(ElementRef, usize)> = None;
+    for el in doc.root_element().descendants().filter_map(ElementRef::wrap) {
+        if let Some(&points) = score.get(&el.id()) {
+            if best.as_ref().is_none_or(|(_, top)| points > *top) {
+                best = Some((el, points));
+            }
+        }
+    }
+    let (best, points) = best?;
+    if points < 250 { return None; }
+    let article = std::iter::once(best)
+        .chain(best.ancestors().filter_map(ElementRef::wrap))
+        .find(|el| el.value().name() == "article");
+    Some(article.unwrap_or(best))
+}
+
+/// Whether an element is page furniture, not article: a menu, a
+/// sidebar, a comment thread, a share bar, a form. Decided by the tag,
+/// the role, or a telling word in the class or id. A block that also
+/// calls itself content ("post has-sidebar") is kept.
+fn furniture(el: &ElementRef) -> bool {
+    const OUT: [&str; 27] = [
+        "share", "sharing", "social", "related", "sidebar", "newsletter", "subscribe", "promo",
+        "advert", "advertisement", "ad", "ads", "comments", "comment", "disqus", "breadcrumb",
+        "breadcrumbs", "cookie", "toolbar", "menu", "nav", "navigation", "footer", "popup",
+        "modal", "widget", "banner",
+    ];
+    const KEEP: [&str; 14] = [
+        "article", "body", "content", "main", "post", "entry", "story", "page", "text",
+        "wrapper", "wrap", "container", "layout", "site",
+    ];
+    let e = el.value();
+    match e.name() {
+        "nav" | "aside" | "footer" | "form" | "button" | "select" | "input" | "textarea" | "dialog" => return true,
+        "html" | "body" => return false,
+        _ => {}
+    }
+    if matches!(e.attr("role"), Some("navigation" | "complementary" | "contentinfo" | "search")) {
+        return true;
+    }
+    let names = format!("{} {}", e.attr("class").unwrap_or(""), e.attr("id").unwrap_or("")).to_ascii_lowercase();
+    let mut out = false;
+    for word in names.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if KEEP.contains(&word) { return false; }
+        if OUT.contains(&word) { out = true; }
+    }
+    out
+}
+
 struct RenderContext<'a> {
     lines: Vec<String>,
     current_line: String,
@@ -229,6 +363,8 @@ struct RenderContext<'a> {
     list_stack: Vec<ListType>,
     base_url: String,
     conf: &'a crate::config::Config,
+    /// The reader view: page furniture inside the article is left out.
+    reader: bool,
 }
 
 enum ListType { Unordered, Ordered(usize) }
@@ -267,6 +403,9 @@ fn handle_element(el: &ElementRef, ctx: &mut RenderContext) {
     let tag = el.value().name.local.as_ref();
 
     if matches!(tag, "script" | "style" | "noscript" | "svg" | "head" | "meta" | "link") {
+        return;
+    }
+    if ctx.reader && furniture(el) {
         return;
     }
 
@@ -781,5 +920,67 @@ fn parse_color(s: &str) -> Option<u8> {
         "white" => Some(255), "black" => Some(0), "red" => Some(196),
         "green" => Some(46), "blue" => Some(21), "yellow" => Some(226),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Long enough to count as running text.
+    const LONG: &str = "A sentence that is long enough to count as running text in an article, twice over. ";
+
+    fn conf() -> crate::config::Config { serde_json::from_str("{}").unwrap() }
+
+    fn reader(body: &str) -> Option<RenderResult> {
+        let html = format!("<html><head><title>Site title</title></head><body>{}</body></html>", body);
+        render_article(&html, 80, "https://example.com/a", &conf())
+    }
+
+    #[test]
+    fn the_reader_view_keeps_the_article_and_drops_the_furniture() {
+        let got = reader(&format!(
+            "<nav><p>Menu words. {0}{0}{0}{0}{0}</p></nav>\
+             <article><h1>The headline</h1><p>First. {0}{0}</p>\
+             <aside><p>Aside words. {0}</p></aside>\
+             <div class=\"share-bar\"><a href=\"/x\">Share this</a></div>\
+             <p>Second. {0}{0}</p></article>\
+             <div id=\"comments\"><div class=\"comment\"><p>Loud reader. {0}{0}{0}{0}{0}{0}{0}{0}</p></div></div>\
+             <footer><p>Footer words. {0}</p></footer>", LONG)).unwrap();
+        let text = crust::strip_ansi(&got.text);
+        for kept in ["The headline", "First.", "Second."] {
+            assert!(text.contains(kept), "{kept} is missing");
+        }
+        for gone in ["Menu words", "Aside words", "Share this", "Loud reader", "Footer words", "Site title"] {
+            assert!(!text.contains(gone), "{gone} is still there");
+        }
+        assert!(got.links.is_empty());
+    }
+
+    #[test]
+    fn a_headline_outside_the_text_block_goes_on_top() {
+        let got = reader(&format!(
+            "<h1>Lost headline</h1><div class=\"content\"><p>{0}{0}{0}</p><p>{0}{0}</p></div>", LONG)).unwrap();
+        assert!(crust::strip_ansi(&got.text).trim_start().starts_with("Lost headline"));
+    }
+
+    #[test]
+    fn text_split_over_sections_is_one_article() {
+        let got = reader(&format!(
+            "<div id=\"story\"><section><p>One. {0}{0}</p></section><section><p>Two. {0}{0}</p></section>\
+             <section><p>Three. {0}{0}</p></section></div>", LONG)).unwrap();
+        let text = crust::strip_ansi(&got.text);
+        assert!(text.contains("One.") && text.contains("Two.") && text.contains("Three."));
+    }
+
+    #[test]
+    fn a_block_that_calls_itself_content_is_not_furniture() {
+        let got = reader(&format!("<div class=\"post has-sidebar\"><p>Kept. {0}{0}{0}{0}</p></div>", LONG)).unwrap();
+        assert!(crust::strip_ansi(&got.text).contains("Kept."));
+    }
+
+    #[test]
+    fn a_page_of_links_has_no_article() {
+        assert!(reader("<ul><li><a href=\"/a\">One</a></li><li><a href=\"/b\">Two</a></li></ul><p>Short line.</p>").is_none());
     }
 }

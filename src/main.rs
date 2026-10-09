@@ -16,7 +16,7 @@ enum FocusItem {
 
 use crust::{Crust, Pane, Input};
 use crust::style;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use config::Config;
@@ -104,6 +104,9 @@ struct App {
     /// burning through glass's IMG_SLOTS (32) within a session.
     last_placed: Vec<ImagePlanEntry>,
     adblock_domains: HashSet<String>,
+    /// Keys read while a page or an answer was on its way, and not yet
+    /// acted on. The main loop takes them before it reads the keyboard.
+    kept: VecDeque<String>,
 }
 
 fn main() {
@@ -225,6 +228,7 @@ fn main() {
         img_thread: None,
         last_placed: Vec::new(),
         adblock_domains: load_adblock(),
+        kept: VecDeque::new(),
     };
 
     app.main.scroll = true;
@@ -299,9 +303,15 @@ fn main() {
         if has_pending { app.check_new_images(); }
         let timeout = if has_pending { Some(1) } else { None };
 
-        let Some(key) = Input::getchr(timeout) else {
-            app.check_new_images();
-            continue;
+        let key = match app.kept.pop_front() {
+            Some(key) => key,
+            None => {
+                let Some(key) = Input::getchr(timeout) else {
+                    app.check_new_images();
+                    continue;
+                };
+                key
+            }
         };
 
         if app.g_pressed {
@@ -358,6 +368,7 @@ fn main() {
             "H" | "BACK" | "C-DOWN" => { app.go_back(); }
             "L" | "DEL" | "C-UP" => { app.go_forward(); }
             "r" => { app.reload(); }
+            "R" => { app.toggle_reader(); }
             "S" => { app.servo_render_cmd(""); }
 
             // Links & forms
@@ -868,17 +879,128 @@ impl App {
 
     // --- Navigation ---
 
+    /// Fetch a page with the keyboard still watched: Esc drops the
+    /// request. `None` means the user stopped it; the screen is then
+    /// back as it was.
+    fn fetch_page(&mut self, url: &str, method: &str, params: Option<&HashMap<String, String>>) -> Option<fetcher::FetchResult> {
+        self.status.say(&format!(" Loading {}... (Esc stops)", url));
+        let kept = &mut self.kept;
+        let got = self.fetcher.fetch_until(url, method, params, &mut || esc_pressed(kept));
+        if got.is_none() {
+            self.render_all();
+            self.status.say(&style::fg(" Stopped", 220));
+        }
+        got
+    }
+
+    /// Lend the terminal to another program and take it back when that
+    /// program ends.
+    fn hand_over(&mut self, cmd: &mut std::process::Command) {
+        Crust::cleanup();
+        let _ = cmd.status();
+        Crust::init();
+        Crust::enable_modifier_keys();
+        Crust::clear_screen();
+        self.handle_resize();
+    }
+
+    /// A PDF link: the file comes down to a private temporary file,
+    /// folio shows it, and the file goes when folio closes.
+    fn open_pdf(&mut self, url: &str) {
+        use std::os::unix::fs::OpenOptionsExt;
+        self.status.say(&format!(" Fetching {}...", url));
+        let mut name = file_name(url);
+        if !name.to_ascii_lowercase().ends_with(".pdf") { name.push_str(".pdf"); }
+        let path = std::env::temp_dir().join(format!("scroll-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_file(&path);
+        let wrote = self.fetcher.fetch_bytes(url).is_some_and(|bytes| {
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes))
+                .is_ok()
+        });
+        if !wrote {
+            self.render_all();
+            self.status.say(&style::fg(" Could not fetch the PDF", 196));
+            return;
+        }
+        self.hand_over(std::process::Command::new("folio").arg(&path));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pull `url` down byte for byte into the download folder. Gives
+    /// back where it landed.
+    fn save_file(&mut self, url: &str) -> Option<String> {
+        let bytes = self.fetcher.fetch_bytes(url)?;
+        let _ = std::fs::create_dir_all(&self.conf.download_folder);
+        let path = format!("{}/{}", self.conf.download_folder, file_name(url));
+        std::fs::write(&path, &bytes).ok()?;
+        Some(path)
+    }
+
+    /// `R`: the article alone, without the page's menus, sidebars and
+    /// footers. A second `R` brings the whole page back as it was.
+    fn toggle_reader(&mut self) {
+        if self.restore_full() { return; }
+        let width = self.main.w as usize;
+        let tab = self.tab();
+        let article = if tab.raw_html.is_empty() {
+            None
+        } else {
+            renderer::render_article(&tab.raw_html, width, &tab.url, &self.conf)
+        };
+        let Some(article) = article else {
+            self.status.say(&style::fg(" No article found on this page", 220));
+            return;
+        };
+        self.show_view(article.text, article.links, article.forms, article.images);
+        self.status.say(" Reader view. R brings the whole page back");
+    }
+
+    /// Put a reader view or a summary where the page is, and keep the
+    /// page so `R` can bring it back.
+    fn show_view(&mut self, content: String, links: Vec<tab::Link>, forms: Vec<tab::Form>, images: Vec<tab::ImageRef>) {
+        self.clear_images();
+        let tab = self.tab_mut();
+        let page = tab::PageView {
+            content: std::mem::replace(&mut tab.content, content),
+            links: std::mem::replace(&mut tab.links, links),
+            forms: std::mem::replace(&mut tab.forms, forms),
+            images: std::mem::replace(&mut tab.images, images),
+            ix: tab.ix,
+        };
+        // A summary of a reader view keeps the page, not the reader view.
+        if tab.full.is_none() { tab.full = Some(Box::new(page)); }
+        tab.ix = 0;
+        self.focus_index = -1;
+        self.search_matches.clear();
+        self.render_all();
+        self.start_image_downloads();
+    }
+
+    /// Bring back the page a reader view or a summary took the place
+    /// of. False when the tab shows its page already.
+    fn restore_full(&mut self) -> bool {
+        let Some(page) = self.tab_mut().full.take() else { return false };
+        self.clear_images();
+        let tab = self.tab_mut();
+        tab.content = page.content;
+        tab.links = page.links;
+        tab.forms = page.forms;
+        tab.images = page.images;
+        tab.ix = page.ix;
+        self.focus_index = -1;
+        self.search_matches.clear();
+        self.render_all();
+        true
+    }
+
     fn navigate(&mut self, url: &str) {
         self.clear_images();
         let resolved = resolve_search(url, &self.conf.search_engine);
 
         // Handle mailto: links - open in Kastrup
         if resolved.starts_with("mailto:") {
-            Crust::cleanup();
-            let _ = std::process::Command::new("kastrup").arg(&resolved).status();
-            Crust::init();
-            Crust::clear_screen();
-            self.handle_resize();
+            self.hand_over(std::process::Command::new("kastrup").arg(&resolved));
             return;
         }
 
@@ -905,59 +1027,76 @@ impl App {
             return;
         }
 
-        self.status.say(&format!(" Loading {}...", &resolved));
+        let Some(result) = self.fetch_page(&resolved, "GET", None) else { return };
 
+        // A PDF goes to folio, sound and film to mpv, where those are
+        // installed. The tab stays on the page the link was on.
+        let kind = kind_of(&result.content_type, &result.url);
+        if kind == Kind::Pdf && on_path("folio") {
+            self.open_pdf(&result.url);
+            return;
+        }
+        if kind == Kind::Media && on_path("mpv") {
+            self.hand_over(std::process::Command::new("mpv").arg("--").arg(&result.url));
+            return;
+        }
+
+        // Only now does the tab move on, so a load that was stopped
+        // leaves it, and its history, as they were.
         self.tab_mut().navigate(&resolved);
-        let result = self.fetcher.fetch(&resolved, "GET", None);
-
-        if result.content_type.starts_with("image/") {
-            // Image URL: download as binary and display
-            let cache_path = img_cache_path(&result.url);
-            if !std::path::Path::new(&cache_path).exists() {
-                if let Some(bytes) = self.fetcher.fetch_bytes(&result.url) {
-                    let _ = std::fs::write(&cache_path, &bytes);
+        match kind {
+            Kind::Image => {
+                // Image URL: download as binary and display
+                let cache_path = img_cache_path(&result.url);
+                if !std::path::Path::new(&cache_path).exists() {
+                    if let Some(bytes) = self.fetcher.fetch_bytes(&result.url) {
+                        let _ = std::fs::write(&cache_path, &bytes);
+                    }
                 }
+                let url = result.url;
+                let filename = url.rsplit('/').next().unwrap_or("image").to_string();
+                // Reserve blank lines for image, then show filename below
+                let reserve = (self.main.h as usize).min(30);
+                let mut content = String::new();
+                for _ in 0..reserve { content.push('\n'); }
+                content.push_str(&format!("\n{}\n{}",
+                    crust::style::fg(&filename, 81),
+                    crust::style::fg(&url, 245)));
+                self.tab_mut().content = content;
+                self.tab_mut().title = filename.clone();
+                self.tab_mut().url = url.clone();
+                self.tab_mut().images = vec![crate::tab::ImageRef {
+                    src: url, line: 0, height: reserve,
+                }];
             }
-            let url = result.url;
-            let filename = url.rsplit('/').next().unwrap_or("image").to_string();
-            // Reserve blank lines for image, then show filename below
-            let reserve = (self.main.h as usize).min(30);
-            let mut content = String::new();
-            for _ in 0..reserve { content.push('\n'); }
-            content.push_str(&format!("\n{}\n{}",
-                crust::style::fg(&filename, 81),
-                crust::style::fg(&url, 245)));
-            self.tab_mut().content = content;
-            self.tab_mut().title = filename.clone();
-            self.tab_mut().url = url.clone();
-            self.tab_mut().images = vec![crate::tab::ImageRef {
-                src: url, line: 0, height: reserve,
-            }];
-        } else if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
-            let width = self.main.w as usize;
-            let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
-            self.tab_mut().content = rendered.text;
-            self.tab_mut().title = rendered.title;
-            self.tab_mut().links = rendered.links;
-            self.tab_mut().forms = rendered.forms;
-            self.tab_mut().images = rendered.images;
-            self.tab_mut().url = result.url;
-            self.tab_mut().site_bg = rendered.site_bg;
-            self.tab_mut().site_fg = rendered.site_fg;
-        } else if result.content_type.starts_with("application/pdf")
-            || result.content_type.starts_with("application/zip")
-            || result.content_type.starts_with("audio/")
-            || result.content_type.starts_with("video/") {
-            // Binary files: offer to download
-            let filename = resolved.rsplit('/').next().unwrap_or("file");
-            self.tab_mut().content = format!("\n{}\n\nType: {}\n\nPress ':download {}' to save",
-                crust::style::bold(filename),
-                result.content_type,
-                resolved);
-            self.tab_mut().title = filename.to_string();
-        } else {
-            self.tab_mut().content = result.body;
-            self.tab_mut().title = resolved.clone();
+            Kind::Page => {
+                let width = self.main.w as usize;
+                let rendered = renderer::render_html(&result.body, width, &result.url, &self.conf);
+                self.tab_mut().content = rendered.text;
+                self.tab_mut().title = rendered.title;
+                self.tab_mut().links = rendered.links;
+                self.tab_mut().forms = rendered.forms;
+                self.tab_mut().images = rendered.images;
+                self.tab_mut().url = result.url;
+                self.tab_mut().site_bg = rendered.site_bg;
+                self.tab_mut().site_fg = rendered.site_fg;
+                // Kept for the reader view (`R`).
+                self.tab_mut().raw_html = result.body;
+            }
+            Kind::Pdf | Kind::Media | Kind::File => {
+                // A file scroll cannot show: offer to save it.
+                let filename = file_name(&result.url);
+                self.tab_mut().content = format!("\n{}\n\nType: {}\n\n:download saves it to {}",
+                    crust::style::bold(&filename),
+                    result.content_type,
+                    self.conf.download_folder);
+                self.tab_mut().title = filename;
+                self.tab_mut().url = result.url;
+            }
+            Kind::Text => {
+                self.tab_mut().content = result.body;
+                self.tab_mut().title = resolved.clone();
+            }
         }
 
         self.focus_index = -1;
@@ -970,17 +1109,17 @@ impl App {
     }
 
     fn go_back(&mut self) {
-        if let Some(url) = self.tab_mut().go_back() {
-            let result = self.fetcher.fetch(&url, "GET", None);
-            self.load_result(result);
-        }
+        let Some(url) = self.tab().back_history.last().map(|e| e.url.clone()) else { return };
+        let Some(result) = self.fetch_page(&url, "GET", None) else { return };
+        self.tab_mut().go_back();
+        self.load_result(result);
     }
 
     fn go_forward(&mut self) {
-        if let Some(url) = self.tab_mut().go_forward() {
-            let result = self.fetcher.fetch(&url, "GET", None);
-            self.load_result(result);
-        }
+        let Some(url) = self.tab().forward_history.last().map(|e| e.url.clone()) else { return };
+        let Some(result) = self.fetch_page(&url, "GET", None) else { return };
+        self.tab_mut().go_forward();
+        self.load_result(result);
     }
 
     fn reload(&mut self) {
@@ -994,6 +1133,7 @@ impl App {
         // state; the visual marker should disappear when the boa
         // engine takes back over.
         self.tab_mut().servo_rendered = false;
+        self.tab_mut().full = None;
         let width = self.main.w as usize;
         if result.content_type.starts_with("text/html") || result.content_type.contains("html") {
             let effective_html = if self.js_enabled {
@@ -1066,6 +1206,7 @@ impl App {
             self.tab_mut().site_fg = rendered.site_fg;
         } else {
             self.tab_mut().content = result.body;
+            self.tab_mut().raw_html.clear();
         }
         self.tab_mut().url = result.url;
         self.focus_index = -1;
@@ -1688,6 +1829,7 @@ impl App {
         tab.images = rendered.images;
         tab.site_bg = rendered.site_bg;
         tab.site_fg = rendered.site_fg;
+        tab.full = None;
         tab.servo_rendered = true;
         self.focus_index = -1;
         self.render_all();
@@ -1927,12 +2069,13 @@ impl App {
             }
         };
 
-        self.tab_mut().navigate(&url);
         let result = if method == "POST" {
-            self.fetcher.fetch(&form.action, "POST", Some(&params))
+            self.fetch_page(&form.action, "POST", Some(&params))
         } else {
-            self.fetcher.fetch(&url, "GET", None)
+            self.fetch_page(&url, "GET", None)
         };
+        let Some(result) = result else { return };
+        self.tab_mut().navigate(&url);
         self.load_result(result);
     }
 
@@ -2242,6 +2385,8 @@ impl App {
             "   H / Backspace / C-↓   back in history".into(),
             "   L / Delete / C-↑      forward in history".into(),
             "   r                  reload".into(),
+            "   Esc                stop a page that is loading".into(),
+            "   R                  reader view: the article alone (R again: whole page)".into(),
             "   S                  re-render via Servo daemon (full SPA support)".into(),
             String::new(),
             format!(" {}", h("Engine tier (per-launch)")),
@@ -2273,7 +2418,7 @@ impl App {
             String::new(),
             format!(" {}", h("Other")),
             "   i                  toggle images".into(),
-            "   I                  AI page summary".into(),
+            "   I                  Claude sums the page up (R: back to the page)".into(),
             "   Ctrl-A             Talk to Claude about this page".into(),
             "   P                  preferences".into(),
             "   C-l                hard redraw (resets kitty image state)".into(),
@@ -2286,7 +2431,9 @@ impl App {
             "   :password          save credentials for current site".into(),
             "   :adblock           update ad-block list".into(),
             "   :ffimport          re-import cookies from current set's FF profile".into(),
-            "   :browse / :ff      open current URL in Firefox (uses set's profile)".into(),
+            "   :browse            open current URL in gaze".into(),
+            "   :ff                open current URL in Firefox (uses set's profile)".into(),
+            "   :download [url]    save the focused link, the page or a URL as a file".into(),
             "   :jslog             show captured console output for this page".into(),
             "   :servo [url] / :S  render through Servo daemon (full SPA support)".into(),
             "   :killservo         stop Servo daemon, reclaim memory".into(),
@@ -2352,88 +2499,107 @@ impl App {
 
     // --- AI ---
 
+    /// `I`: Claude sums up what is on screen. The answer takes the
+    /// page's place; `R` brings the page back.
     fn ai_summary(&mut self) {
-        if self.conf.ai_key.is_empty() {
-            // Try /home/.safe/openai.txt
-            if let Ok(key) = std::fs::read_to_string("/home/.safe/openai.txt") {
-                self.conf.ai_key = key.trim().to_string();
-            } else {
-                self.status.say(&style::fg(" No AI key configured", 220));
-                return;
-            }
+        let text = crust::strip_ansi(&self.tab().content);
+        if text.trim().is_empty() {
+            self.status.say(&style::fg(" Nothing on this page to sum up", 220));
+            return;
         }
-        self.status.say(" Asking AI...");
-        let content = crust::strip_ansi(&self.tab().content);
-        let text = head(&content, 4000);
-        let body = serde_json::json!({
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": format!(
-                "Summarize this web page concisely.\nTitle: {}\nURL: {}\n\n{}",
-                self.tab().title, self.tab().url, text
-            )}],
-            "max_tokens": 600
-        });
-        let resp = std::process::Command::new("curl")
-            .args(["-s", "-X", "POST", "https://api.openai.com/v1/chat/completions",
-                   "-H", "Content-Type: application/json",
-                   "-H", &format!("Authorization: Bearer {}", self.conf.ai_key),
-                   "-d", &body.to_string()])
-            .output();
-        if let Ok(o) = resp {
-            let json_str = String::from_utf8_lossy(&o.stdout);
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                let summary = json["choices"][0]["message"]["content"].as_str().unwrap_or("No response");
-                // The page's images belong to text that is no longer on
-                // screen. Drop them from the tab, then take the placements
-                // down: render_main re-places whatever the tab still lists,
-                // so clearing alone would put them straight back over the
-                // summary. They return on reload.
-                self.tab_mut().images.clear();
-                self.clear_images();
-                self.tab_mut().content = format!("{}\n\n{}", style::bold("AI Summary"), summary);
-                self.tab_mut().ix = 0;
-                self.render_main();
-                return;
+        let prompt = format!(
+            "Sum up this web page for me in a few short paragraphs, in the language it is written in. \
+             Plain text, no Markdown.\nTitle: {}\nURL: {}",
+            self.tab().title, self.tab().url);
+        self.status.say(" Asking Claude... (Esc stops)");
+        match self.ask_claude(&prompt, &text) {
+            Ok(Some(answer)) => {
+                let width = (self.main.w as usize).saturating_sub(2).clamp(20, 100);
+                let content = format!("{}\n\n{}", style::bold("Summary"), wrap(&answer, width));
+                self.show_view(content, Vec::new(), Vec::new(), Vec::new());
+                self.status.say(" Summary by Claude. R brings the page back");
             }
+            Ok(None) => {
+                self.render_status();
+                self.status.say(&style::fg(" Stopped", 220));
+            }
+            Err(why) => self.status.say(&style::fg(&format!(" {}", why), 196)),
         }
-        self.status.say(&style::fg(" AI request failed", 196));
     }
 
-    /// `Ctrl-A` — talk to Claude about this page, for as long as you
-    /// like. The page text goes to a file and the terminal goes to
-    /// `claude`, so the whole session is there: follow-up questions, the
-    /// web, your files. scroll picks its screen back up on exit. Same
-    /// shape as kastrup's Ctrl-A, so the two feel like one thing.
+    /// One question to `claude -p`, with `input` on its standard input,
+    /// so the page lands neither on disk nor on a command line. Esc
+    /// gives up and stops claude: `Ok(None)`.
+    fn ask_claude(&mut self, prompt: &str, input: &str) -> Result<Option<String>, String> {
+        use std::io::{Read, Write};
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        // A process group of its own, so Esc can stop claude together
+        // with whatever it started.
+        let mut child = Command::new("claude")
+            .args(["-p", prompt])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => "claude is not installed".to_string(),
+                _ => format!("claude would not start: {}", e),
+            })?;
+        let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
+        let input = input.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some(mut stdin) = stdin { let _ = stdin.write_all(input.as_bytes()); }
+            let mut answer = String::new();
+            if let Some(mut stdout) = stdout { let _ = stdout.read_to_string(&mut answer); }
+            let _ = tx.send(answer);
+        });
+        let answer = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(answer) => break answer,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if esc_pressed(&mut self.kept) {
+                        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGTERM); }
+                        let _ = child.wait();
+                        return Ok(None);
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break String::new(),
+            }
+        };
+        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+        let answer = answer.trim();
+        if !ok || answer.is_empty() {
+            return Err("Claude gave no answer".into());
+        }
+        Ok(Some(answer.to_string()))
+    }
+
+    /// `Ctrl-A`: talk to Claude about this page, for as long as you
+    /// like. The suite's shared session: the page text goes to a file
+    /// only the user can read, the terminal goes to `claude`, and
+    /// scroll picks its screen back up on exit.
     fn ai_chat(&mut self) {
-        let (title, url) = (self.tab().title.clone(), self.tab().url.clone());
         let text = crust::strip_ansi(&self.tab().content);
         if text.trim().is_empty() {
             self.status.say(&style::fg(" Nothing on this page to discuss", 220));
             return;
         }
-        let tmpfile = format!("/tmp/scroll_page_{}.txt", std::process::id());
-        if std::fs::write(&tmpfile, &text).is_err() {
-            self.status.say(&style::fg(" Could not write the page out", 196));
-            return;
-        }
-        let initial = format!(
-            "I am reading this page in scroll, my terminal browser, and want to talk about it.\n\n\
-             Title: {}\nURL: {}\n\n\
-             The text is in {} — read it first, then answer briefly. \
-             Ask me what I want to know if I have not said.",
-            title, url, tmpfile);
-
-        self.status.say(" Handing over to claude...");
-        use std::io::Write as _;
-        let _ = std::io::stdout().flush();
-        Crust::cleanup();
-        Crust::clear_screen();
-        let _ = std::process::Command::new("claude").arg(&initial).status();
-        Crust::init();
-        let _ = std::fs::remove_file(&tmpfile);
+        let intro = format!(
+            "I am reading a page in scroll, my terminal browser, and want to talk about it. Title: {}. URL: {}.",
+            self.tab().title, self.tab().url);
         self.clear_images();
-        self.render_all();
-        self.status.say(" Back from claude");
+        let started = crust::claude_session("Scroll", &intro, &text);
+        Crust::enable_modifier_keys();
+        Crust::clear_screen();
+        self.handle_resize();
+        if started {
+            self.status.say(" Back from claude");
+        } else {
+            self.status.say(&style::fg(" claude is not installed", 196));
+        }
     }
 
     // --- Command mode ---
@@ -2476,21 +2642,25 @@ impl App {
             }
             "bookmarks" | "bms" => { self.show_bookmarks(); }
             "download" | "dl" => {
-                if !args.is_empty() {
-                    let result = self.fetcher.fetch(args, "GET", None);
-                    let filename = args.rsplit('/').next().unwrap_or("download");
-                    let path = format!("{}/{}", self.conf.download_folder, filename);
-                    if std::fs::write(&path, &result.body).is_ok() {
-                        self.status.say(&style::fg(&format!(" Downloaded: {}", path), 82));
-                    } else {
-                        self.status.say(&style::fg(" Download failed", 196));
-                    }
+                // No URL given: the focused link, else the page itself.
+                let url = if !args.is_empty() {
+                    args.to_string()
+                } else if let Some(link) = usize::try_from(self.focus_index).ok().and_then(|i| self.tab().links.get(i)) {
+                    link.href.clone()
+                } else {
+                    self.tab().url.clone()
+                };
+                self.status.say(&format!(" Downloading {}...", url));
+                match self.save_file(&url) {
+                    Some(path) => self.status.say(&style::fg(&format!(" Downloaded: {}", path), 82)),
+                    None => self.status.say(&style::fg(" Download failed", 196)),
                 }
             }
             "password" | "pw" => { self.save_password_cmd(); }
             "adblock" => { self.update_adblock(); }
             "ffimport" => { self.ffimport_cmd(); }
-            "browse" | "ff" => { self.browse_in_firefox(); }
+            "browse" => { self.browse(); }
+            "ff" => { self.browse_in_firefox(); }
             "jslog" => { self.show_jslog(); }
             "servo" | "S" => { self.servo_render_cmd(args); }
             "killservo" => { self.killservo_cmd(); }
@@ -2582,7 +2752,32 @@ impl App {
         self.render_all();
     }
 
-    /// `:browse` (alias `:ff`) — open the current URL in Firefox,
+    /// `:browse` — open the current URL in gaze, the suite's own
+    /// browser. Where gaze is not installed, Firefox takes it.
+    fn browse(&mut self) {
+        if !on_path("gaze") {
+            self.browse_in_firefox();
+            return;
+        }
+        let url = self.tab().url.clone();
+        if url.is_empty() || url == "about:home" || url == "about:blank" {
+            self.status.say(&style::fg(" Nothing to browse — open a URL first", 220));
+            return;
+        }
+        // A second gaze passes the URL to the one that runs and ends.
+        let started = std::process::Command::new("gaze")
+            .arg(&url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        match started {
+            Ok(_) => self.status.say(&format!(" Opened in gaze: {}", url)),
+            Err(e) => self.status.say(&style::fg(&format!(" gaze would not start: {}", e), 196)),
+        }
+    }
+
+    /// `:ff` — open the current URL in Firefox,
     /// targeting the active set's Firefox profile if one is mapped.
     /// The escape hatch for sites whose JS scroll's minimal DOM
     /// can't run (Google login, Trusted-Types-heavy SPAs, anything
@@ -2670,6 +2865,7 @@ impl App {
                 tab.images = rendered.images;
                 tab.site_bg = rendered.site_bg;
                 tab.site_fg = rendered.site_fg;
+                tab.full = None;
                 tab.servo_rendered = true;
                 tab.ix = 0;
                 self.main.ix = 0;
@@ -3109,6 +3305,84 @@ fn find_element_inner_range(html: &str, wanted_id: &str) -> Option<(usize, usize
     Some((open_end, close_start))
 }
 
+/// One look at the keyboard while a page or an answer is on its way:
+/// true when Esc is the first key pressed since the wait began. Any
+/// other key is kept for the main loop, and the keyboard is then left
+/// alone, so what was typed ahead keeps its order.
+fn esc_pressed(kept: &mut VecDeque<String>) -> bool {
+    if kept.iter().any(|k| k != "RESIZE") { return false; }
+    match Input::getchr_ms(0) {
+        Some(key) if key == "ESC" => true,
+        Some(key) => { kept.push_back(key); false }
+        None => false,
+    }
+}
+
+/// What a link turned out to be.
+#[derive(Debug, PartialEq)]
+enum Kind { Page, Image, Pdf, Media, File, Text }
+
+/// Sort a fetched link by its content type. A server that only says
+/// "a file" (octet-stream) is helped out by the ending of the name.
+fn kind_of(content_type: &str, url: &str) -> Kind {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("image/") { return Kind::Image; }
+    if ct.contains("html") { return Kind::Page; }
+    if ct.starts_with("application/pdf") { return Kind::Pdf; }
+    if ct.starts_with("audio/") || ct.starts_with("video/") { return Kind::Media; }
+    if ct.starts_with("application/zip") { return Kind::File; }
+    if ct.starts_with("application/octet-stream") {
+        let name = file_name(url).to_ascii_lowercase();
+        return match name.rsplit_once('.').map(|(_, ending)| ending).unwrap_or("") {
+            "pdf" => Kind::Pdf,
+            "mp3" | "wav" | "ogg" | "oga" | "opus" | "flac" | "m4a" | "aac"
+            | "mp4" | "m4v" | "webm" | "mkv" | "mov" | "avi" => Kind::Media,
+            _ => Kind::File,
+        };
+    }
+    Kind::Text
+}
+
+/// A safe file name for what `url` points at: the last part of its
+/// path, without the query, never hidden and never a path of its own.
+fn file_name(url: &str) -> String {
+    let path = match url::Url::parse(url) {
+        Ok(u) => u.path().to_string(),
+        Err(_) => url.split(['?', '#']).next().unwrap_or("").to_string(),
+    };
+    let last = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+    let name: String = last.chars().filter(|c| !c.is_control() && *c != '\\').collect();
+    let name = name.trim_start_matches('.');
+    if name.is_empty() { "download".into() } else { name.to_string() }
+}
+
+/// Whether a program of this name is on PATH. It looks; it starts nothing.
+fn on_path(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
+}
+
+/// Break plain text into lines of at most `width` columns, at spaces.
+fn wrap(text: &str, width: usize) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut col = 0;
+        for word in line.split_whitespace() {
+            let w = crust::display_width(word);
+            if col > 0 && col + 1 + w > width {
+                out.push('\n');
+                col = 0;
+            } else if col > 0 {
+                out.push(' ');
+                col += 1;
+            }
+            out.push_str(word);
+            col += w;
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// The first `n` bytes of `s`, cut back to a whole character. A plain
 /// `&s[..n]` panics when byte `n` is inside an æ or a curly quote.
 fn head(s: &str, n: usize) -> &str { &s[..s.floor_char_boundary(n)] }
@@ -3185,12 +3459,47 @@ impl PrefItem {
 
 #[cfg(test)]
 mod tests {
-    use super::head;
+    use super::{file_name, head, kind_of, wrap, Kind};
 
     #[test]
     fn a_cut_never_lands_inside_a_character() {
         assert_eq!(head("aæb", 2), "a");
         assert_eq!(head("aæb", 3), "aæ");
         assert_eq!(head("abc", 10), "abc");
+    }
+
+    #[test]
+    fn a_link_is_sorted_by_what_the_server_calls_it() {
+        assert_eq!(kind_of("text/html; charset=utf-8", "https://a.b/x"), Kind::Page);
+        assert_eq!(kind_of("image/png", "https://a.b/x"), Kind::Image);
+        assert_eq!(kind_of("application/pdf", "https://a.b/x"), Kind::Pdf);
+        assert_eq!(kind_of("audio/mpeg", "https://a.b/x"), Kind::Media);
+        assert_eq!(kind_of("video/mp4", "https://a.b/x"), Kind::Media);
+        assert_eq!(kind_of("application/zip", "https://a.b/x.zip"), Kind::File);
+        assert_eq!(kind_of("text/plain", "https://a.b/x.txt"), Kind::Text);
+    }
+
+    #[test]
+    fn a_plain_file_is_sorted_by_the_ending_of_its_name() {
+        let file = "application/octet-stream";
+        assert_eq!(kind_of(file, "https://a.b/paper.PDF?dl=1"), Kind::Pdf);
+        assert_eq!(kind_of(file, "https://a.b/song.mp3"), Kind::Media);
+        assert_eq!(kind_of(file, "https://a.b/tool.tar.gz"), Kind::File);
+    }
+
+    #[test]
+    fn a_file_name_is_never_a_path_and_never_hidden() {
+        assert_eq!(file_name("https://a.b/dir/paper.pdf?x=1#top"), "paper.pdf");
+        assert_eq!(file_name("https://a.b/dir/"), "dir");
+        assert_eq!(file_name("https://a.b/"), "download");
+        assert_eq!(file_name("https://a.b/x/..%2f..%2f.bashrc"), "%2f..%2f.bashrc");
+        assert_eq!(file_name("https://a.b/.bashrc"), "bashrc");
+        assert!(!file_name("https://a.b/a/../../etc/passwd").contains('/'));
+    }
+
+    #[test]
+    fn long_lines_break_at_spaces() {
+        assert_eq!(wrap("one two three four", 9), "one two\nthree\nfour\n");
+        assert_eq!(wrap("a\n\nb", 9), "a\n\nb\n");
     }
 }

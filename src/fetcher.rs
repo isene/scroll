@@ -22,12 +22,42 @@ pub struct Fetcher {
     max_cache: usize,
     /// Long-lived current-thread tokio runtime. rquest is async-only,
     /// scroll's call sites are sync — `block_on` bridges the two.
-    runtime: Runtime,
+    /// Shared, so a fetch the user may stop can be driven from a
+    /// thread of its own.
+    runtime: std::sync::Arc<Runtime>,
     /// Browser-impersonating HTTP client. The `Emulation::Firefox136`
     /// profile sets cipher order, ALPN, HTTP/2 SETTINGS frame order
     /// and the canonical Firefox header set, so Cloudflare's
     /// JA3-bound `cf_clearance` cookie keeps validating after import.
     client: Client,
+}
+
+/// A fetch after its first, waitless step.
+enum Start {
+    Done(FetchResult),
+    Ask(std::pin::Pin<Box<dyn std::future::Future<Output = Result<Got, String>> + Send>>),
+}
+
+/// What the network gave back, before the fetcher has taken it in.
+struct Got {
+    result: FetchResult,
+    set_cookies: Vec<String>,
+}
+
+/// A bare `example.com` is asked for over https.
+fn with_scheme(url: &str) -> String {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        url.to_string()
+    } else {
+        format!("https://{}", url)
+    }
+}
+
+/// Whether a body of this type is shown as text. The rest (pictures,
+/// sound, film, PDFs, archives) is shown or saved from its bytes.
+fn is_text(content_type: &str) -> bool {
+    let binary = ["image/", "audio/", "video/", "application/pdf", "application/zip", "application/octet-stream"];
+    !binary.iter().any(|b| content_type.starts_with(b))
 }
 
 #[derive(Clone)]
@@ -45,8 +75,13 @@ impl Fetcher {
     /// so existing logins survive the per-set isolation upgrade.
     pub fn new_with_set(set_name: &str) -> Self {
         Self::migrate_legacy_cookies_jar(set_name);
+        Self::with_jar(set_name, Self::load_jar(set_name))
+    }
+
+    /// A fetcher around a jar that is already in hand. Touches no file.
+    fn with_jar(set_name: &str, jar: CookieJar) -> Self {
         let mut jars: HashMap<String, CookieJar> = HashMap::new();
-        jars.insert(set_name.to_string(), Self::load_jar(set_name));
+        jars.insert(set_name.to_string(), jar);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -65,7 +100,7 @@ impl Fetcher {
             cache: HashMap::new(),
             cache_order: Vec::new(),
             max_cache: 20,
-            runtime,
+            runtime: std::sync::Arc::new(runtime),
             client,
         }
     }
@@ -355,128 +390,168 @@ impl Fetcher {
     }
 
     pub fn fetch(&mut self, url: &str, method: &str, params: Option<&HashMap<String, String>>) -> FetchResult {
+        match self.start(url, method, params) {
+            Start::Done(result) => result,
+            Start::Ask(ask) => {
+                let got = self.runtime.block_on(ask);
+                self.finish(url, method, params.is_none(), got)
+            }
+        }
+    }
+
+    /// `fetch` with a way out. `stop` is asked ten times a second while
+    /// the answer is on its way; when it says yes the request is dropped
+    /// and `None` comes back, with cookies and cache as they were.
+    pub fn fetch_until(
+        &mut self,
+        url: &str,
+        method: &str,
+        params: Option<&HashMap<String, String>>,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> Option<FetchResult> {
+        let ask = match self.start(url, method, params) {
+            Start::Done(result) => return Some(result),
+            Start::Ask(ask) => ask,
+        };
+        // The request runs as a task, driven by a thread of its own, so
+        // this thread is free to look at the keyboard. Dropping the task
+        // closes its connection.
+        let task = self.runtime.spawn(ask);
+        let abort = task.abort_handle();
+        let runtime = self.runtime.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || { let _ = tx.send(runtime.block_on(task)); });
+        let got = loop {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(Ok(got)) => break got,
+                Ok(Err(e)) => break Err(e.to_string()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if stop() {
+                        abort.abort();
+                        return None;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err("the request died".into()),
+            }
+        };
+        Some(self.finish(url, method, params.is_none(), got))
+    }
+
+    /// The part of a fetch that needs no waiting: a cached page or a
+    /// local file is done at once; anything else becomes a request,
+    /// ready to run.
+    fn start(&self, url: &str, method: &str, params: Option<&HashMap<String, String>>) -> Start {
         // Check cache for GET without params (O(1) HashMap lookup)
         if method == "GET" && params.is_none() {
             if let Some(cached) = self.cache.get(url) {
-                return cached.clone();
+                return Start::Done(cached.clone());
             }
         }
 
         // Handle file:// URLs
         if url.starts_with("file://") {
             let path = &url[7..];
-            match fs::read_to_string(path) {
-                Ok(body) => return FetchResult {
+            return Start::Done(match fs::read_to_string(path) {
+                Ok(body) => FetchResult {
                     body,
                     content_type: guess_content_type(path),
                     url: url.to_string(),
                     status: 200,
                 },
-                Err(e) => return FetchResult {
+                Err(e) => FetchResult {
                     body: format!("Error reading file: {}", e),
                     content_type: "text/plain".into(),
                     url: url.to_string(),
                     status: 404,
                 },
-            }
+            });
         }
 
-        // Normalize URL
-        let fetch_url = if !url.starts_with("http://") && !url.starts_with("https://") {
-            format!("https://{}", url)
-        } else {
-            url.to_string()
-        };
+        let fetch_url = with_scheme(url);
 
-        // Build cookies up-front so the async block can be a pure send.
+        // Build cookies up-front so the request can be a pure send.
         // Walks the subdomain chain (accounts.google.com → google.com)
         // so cookies stored on `google.com` match a request to
         // `accounts.google.com`. Required for Firefox-imported cookies
         // which use bare-domain (leading-dot stripped on import).
         let cookie_str = self.build_cookie_header(&fetch_url);
-        let m = if method == "POST" { Method::POST } else { Method::GET };
+        let post = method == "POST";
+        let form = if post { params.cloned() } else { None };
+        let client = self.client.clone();
 
-        let result: Result<rquest::Response, _> = self.runtime.block_on(async {
-            let mut req = self.client.request(m, &fetch_url);
+        Start::Ask(Box::pin(async move {
+            let mut req = client.request(if post { Method::POST } else { Method::GET }, &fetch_url);
             if !cookie_str.is_empty() {
                 req = req.header("Cookie", cookie_str);
             }
-            if method == "POST" {
-                if let Some(p) = params {
-                    req.form(p).send().await
-                } else {
-                    req.send().await
-                }
-            } else {
-                req.send().await
+            if let Some(form) = &form {
+                req = req.form(form);
             }
-        });
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let url = resp.url().to_string();
+            let status = resp.status().as_u16();
+            let content_type = resp.headers()
+                .get(rquest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("text/html")
+                .to_string();
+            let set_cookies: Vec<String> = resp.headers()
+                .get_all(rquest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
+                .collect();
+            // A picture, a film or a PDF is never shown as text, so its
+            // bytes are not pulled down here; whoever shows or saves it
+            // asks for them with `fetch_bytes`.
+            let body = if is_text(&content_type) { resp.text().await.unwrap_or_default() } else { String::new() };
+            Ok(Got { result: FetchResult { body, content_type, url, status }, set_cookies })
+        }))
+    }
 
-        match result {
-            Ok(resp) => {
-                let final_url = resp.url().to_string();
-                let status = resp.status().as_u16();
-                let ct = resp.headers()
-                    .get(rquest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("text/html")
-                    .to_string();
-                let set_cookies: Vec<String> = resp.headers()
-                    .get_all(rquest::header::SET_COOKIE)
-                    .iter()
-                    .filter_map(|v| v.to_str().ok().map(|s| s.to_string()))
-                    .collect();
-
-                let body = self.runtime.block_on(async {
-                    resp.text().await.unwrap_or_default()
-                });
-
-                self.store_set_cookies(&final_url, &set_cookies);
-
-                let result = FetchResult {
-                    body,
-                    content_type: ct,
-                    url: final_url,
-                    status,
-                };
-
-                // Cache GET results
-                if method == "GET" && params.is_none() && status == 200 {
-                    let key = url.to_string();
-                    if !self.cache.contains_key(&key) {
-                        self.cache_order.push(key.clone());
-                    }
-                    self.cache.insert(key, result.clone());
-                    while self.cache.len() > self.max_cache {
-                        if let Some(oldest) = self.cache_order.first().cloned() {
-                            self.cache.remove(&oldest);
-                            self.cache_order.remove(0);
-                        } else { break; }
-                    }
-                }
-
-                result
-            }
-            Err(e) => FetchResult {
+    /// The part of a fetch that changes the fetcher: cookies the server
+    /// set go in the jar, a good GET goes in the cache.
+    fn finish(&mut self, url: &str, method: &str, plain: bool, got: Result<Got, String>) -> FetchResult {
+        let Got { result, set_cookies } = match got {
+            Ok(got) => got,
+            Err(e) => return FetchResult {
                 body: format!("Error: {}", e),
                 content_type: "text/plain".into(),
-                url: fetch_url,
+                url: with_scheme(url),
                 status: 0,
             },
+        };
+        self.store_set_cookies(&result.url, &set_cookies);
+
+        // Cache GET results
+        if method == "GET" && plain && result.status == 200 {
+            let key = url.to_string();
+            if !self.cache.contains_key(&key) {
+                self.cache_order.push(key.clone());
+            }
+            self.cache.insert(key, result.clone());
+            while self.cache.len() > self.max_cache {
+                if let Some(oldest) = self.cache_order.first().cloned() {
+                    self.cache.remove(&oldest);
+                    self.cache_order.remove(0);
+                } else { break; }
+            }
         }
+        result
     }
 
     /// Fetch binary data (for images) - returns raw bytes.
     /// Uses the same Firefox-impersonating client as `fetch`, so
     /// `cf_clearance`-gated CDNs (e.g. github avatars) keep working.
     pub fn fetch_bytes(&self, url: &str) -> Option<Vec<u8>> {
-        let fetch_url = if !url.starts_with("http://") && !url.starts_with("https://") {
-            format!("https://{}", url)
-        } else {
-            url.to_string()
-        };
+        let fetch_url = with_scheme(url);
+        // The cookies go along, so a file behind a login comes down too.
+        let cookie_str = self.build_cookie_header(&fetch_url);
         self.runtime.block_on(async {
-            let resp = self.client.get(&fetch_url).send().await.ok()?;
+            let mut req = self.client.get(&fetch_url);
+            if !cookie_str.is_empty() {
+                req = req.header("Cookie", cookie_str);
+            }
+            let resp = req.send().await.ok()?;
             let bytes = resp.bytes().await.ok()?;
             if bytes.is_empty() { None } else { Some(bytes.to_vec()) }
         })
@@ -568,4 +643,66 @@ fn guess_content_type(path: &str) -> String {
         "pdf" => "application/pdf",
         _ => "text/html",
     }.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    /// A web server for one request on a free local port. It waits
+    /// `delay` before it answers.
+    fn serve(content_type: &'static str, body: &'static str, delay: Duration) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                std::thread::sleep(delay);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    content_type, body.len(), body
+                );
+            }
+        });
+        format!("http://{}/page", addr)
+    }
+
+    fn fetcher() -> Fetcher { Fetcher::with_jar("test", HashMap::new()) }
+
+    #[test]
+    fn a_page_nobody_stops_comes_back_whole() {
+        let url = serve("text/html", "<p>hello</p>", Duration::ZERO);
+        let mut f = fetcher();
+        let got = f.fetch_until(&url, "GET", None, &mut || false).unwrap();
+        assert_eq!((got.status, got.body.as_str()), (200, "<p>hello</p>"));
+        // The server took one request and is gone: this is the cache.
+        assert_eq!(f.fetch(&url, "GET", None).body, "<p>hello</p>");
+    }
+
+    #[test]
+    fn a_slow_page_can_be_stopped() {
+        let url = serve("text/html", "late", Duration::from_secs(20));
+        let mut f = fetcher();
+        let began = Instant::now();
+        let mut asked = 0;
+        let got = f.fetch_until(&url, "GET", None, &mut || { asked += 1; asked == 2 });
+        assert!(got.is_none());
+        assert!(began.elapsed() < Duration::from_secs(2), "took {:?}", began.elapsed());
+        assert!(f.cache.is_empty());
+        // The fetcher still works after a stop.
+        let next = serve("text/plain", "next", Duration::ZERO);
+        assert_eq!(f.fetch(&next, "GET", None).body, "next");
+    }
+
+    #[test]
+    fn a_film_is_not_pulled_down_as_text() {
+        let url = serve("video/mp4", "0123456789", Duration::ZERO);
+        let got = fetcher().fetch(&url, "GET", None);
+        assert_eq!(got.content_type, "video/mp4");
+        assert!(got.body.is_empty());
+    }
 }

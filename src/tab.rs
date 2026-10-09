@@ -34,6 +34,20 @@ pub struct Tab {
     /// non-Servo navigation. The renderer uses this to mark the tab
     /// visually so the user knows which engine is active.
     pub servo_rendered: bool,
+    /// The whole page, kept while a reader view or a summary has its
+    /// place. `None` when the tab shows the page itself.
+    pub full: Option<Box<PageView>>,
+}
+
+/// What a tab shows of a page: the text, what can be followed or
+/// filled in, the pictures and the scroll position.
+#[derive(Clone)]
+pub struct PageView {
+    pub content: String,
+    pub links: Vec<Link>,
+    pub forms: Vec<Form>,
+    pub images: Vec<ImageRef>,
+    pub ix: usize,
 }
 
 #[derive(Clone)]
@@ -98,6 +112,7 @@ impl Tab {
             js_scripts: Vec::new(),
             raw_html: String::new(),
             servo_rendered: false,
+            full: None,
         }
     }
 
@@ -117,6 +132,9 @@ impl Tab {
         self.images.clear();
         self.site_bg = None;
         self.site_fg = None;
+        // The page source and a kept page belong to the page left behind.
+        self.raw_html.clear();
+        self.full = None;
     }
 
     pub fn go_back(&mut self) -> Option<String> {

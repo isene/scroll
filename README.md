@@ -4,7 +4,7 @@
 
 ![Rust](https://img.shields.io/badge/language-Rust-f74c00) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue) ![Binary](https://img.shields.io/badge/binary-4.8MB-orange) ![Stay Amazing](https://img.shields.io/badge/Stay-Amazing-important)
 
-A keyboard-driven terminal web browser with inline image display, tabs, form handling, bookmarks, and AI page summaries. Vim-style keybindings. Feature clone of [brrowser](https://github.com/isene/brrowser).
+A keyboard-driven terminal web browser with inline image display, tabs, form handling, bookmarks, a reader view and page summaries by Claude. Vim-style keybindings. Feature clone of [brrowser](https://github.com/isene/brrowser).
 
 Built on [crust](https://github.com/isene/crust) (TUI) and [glow](https://github.com/isene/glow) (images). Single binary, ~4.8MB.
 
@@ -53,10 +53,13 @@ Press `?` for built-in help. Press `q` to quit.
 - **Link following**: TAB to cycle links (shown in reverse), ENTER to follow, or type link number
 - **Site colors**: Extracts background/foreground from HTML/CSS, applies to content pane
 - **Cookies**: Persistent cookie storage
-- **AI summaries**: OpenAI GPT page summarization (I key)
+- **Reader view**: `R` shows the article alone, without menus, sidebars, comments and footers
+- **Stop a slow page**: `Esc` drops a page that is still loading
+- **Claude**: `I` sums the page up, `Ctrl-A` opens a full Claude session about it (both need [Claude Code](https://claude.com/claude-code); no API key)
+- **PDF, sound and film**: a PDF link opens in [folio](https://github.com/isene/folio), sound and film in mpv, where those are installed
 - **Preferences**: Interactive popup (P key) with 20 configurable settings including colors
 - **Search engines**: Google (g), DuckDuckGo (ddg), Wikipedia (w)
-- **Downloads**: `:download URL` command
+- **Downloads**: `:download` saves the focused link, the page or a URL, byte for byte
 - **Clipboard**: Copy URL (y) or focused link (Y) via OSC 52
 
 ## Keyboard Reference
@@ -80,6 +83,8 @@ Press `?` for built-in help. Press `q` to quit.
 | H, Backspace | Go back |
 | L, Delete | Go forward |
 | r | Reload |
+| Esc | Stop a page that is loading |
+| R | Reader view: the article alone (R again: the whole page) |
 
 ### Tabs
 | Key | Action |
@@ -112,7 +117,7 @@ Press `?` for built-in help. Press `q` to quit.
 | Key | Action |
 |-----|--------|
 | i | Toggle images |
-| I | AI page summary |
+| I | Claude sums the page up (R: back to the page) |
 | Ctrl-A | Talk to Claude about this page, with follow-up questions |
 | P | Preferences popup |
 | Ctrl-L | Force redraw |
@@ -131,7 +136,9 @@ Press `?` for built-in help. Press `q` to quit.
 | `:reload` | Reload page |
 | `:bookmark` / `:bm` | Bookmark current page |
 | `:bookmarks` / `:bms` | List bookmarks |
-| `:download URL` / `:dl URL` | Download file |
+| `:download [URL]` / `:dl [URL]` | Save a file: the URL, else the focused link, else the page |
+| `:browse` | Open the current URL in [gaze](https://github.com/isene/gaze) (Firefox where gaze is missing) |
+| `:ff` | Open the current URL in Firefox |
 | `:help` | Show help |
 
 ## Configuration
@@ -158,7 +165,9 @@ Change via Preferences (P key) or edit `config.json`.
 **Runtime** (optional, for full features):
 - [chafa](https://hpjansson.org/chafa/) - ASCII art image fallback
 - [ImageMagick](https://imagemagick.org/) (`convert`) - Image scaling for kitty/sixel
-- `curl` - AI summary feature
+- [Claude Code](https://claude.com/claude-code) (`claude`) - page summary (`I`) and Claude session (`Ctrl-A`)
+- [folio](https://github.com/isene/folio) - PDF links
+- [mpv](https://mpv.io/) - sound and film links
 
 ## Part of the Fe2O3 Rust Terminal Suite
 

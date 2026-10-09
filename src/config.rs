@@ -137,15 +137,11 @@ pub struct Config {
     pub c_h2: u16,
     #[serde(default = "default_h3")]
     pub c_h3: u16,
-    // AI
-    #[serde(default)]
-    pub ai_key: String,
     /// Optional external password command. Called as `<cmd> <host>`;
     /// must print exactly two lines on stdout: `username\npassword\n`.
     /// Empty string = disabled (use built-in `passwords.json` only).
-    /// Example wrapper for the user's HyperList password file:
-    ///   `~/bin/scroll-pass` reads `/home/.safe/.p.hl`, looks up
-    ///   `$1`, emits `user\npass`.
+    /// Example: a wrapper `~/bin/scroll-pass` that looks `$1` up in
+    /// your password file and prints `user\npass`.
     #[serde(default)]
     pub password_command: String,
     /// Per-set foreground colors (256-color codes). Indexed by set
