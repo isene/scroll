@@ -873,11 +873,11 @@ impl App {
         } else {
             " ? help | : command".to_string()
         };
-        let version = format!("scroll v{}", env!("CARGO_PKG_VERSION"));
+        let version = crust::version_tag("scroll", env!("CARGO_PKG_VERSION"));
         let url = &tab.url;
         let mid = format!(" | {}", url);
         let total_left = crust::display_width(&left) + crust::display_width(&mid);
-        let pad = (self.cols as usize).saturating_sub(total_left + version.len() + 1);
+        let pad = (self.cols as usize).saturating_sub(total_left + crust::display_width(&version));
         self.status.say(&format!("{}{}{}{}", left, mid, " ".repeat(pad), version));
     }
 
